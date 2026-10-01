@@ -1,0 +1,2237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>看谱Pro</title>
+
+<!-- 背景图内嵌为 data:URL（生成物，缺失时自动退回 background.jpg）。
+     为什么必须内嵌：用 file:// 直接打开时，页面和 background.jpg 属于不同源，
+     图片画进 canvas 后画布被标记为"已污染"，于是
+       getImageData 抛 SecurityError -> 分割线/文字阴影的亮度自适应全失效
+       texImage2D   抛 SecurityError -> 描边层和 glass-gl 的液态玻璃全失效
+     实测（Edge，file:// 下）：glass-gl 报
+       Failed to execute 'texImage2D' on 'WebGLRenderingContext': Tainted canvases may not be loaded.
+     data:URL 与页面同源，不会污染画布，内嵌之后本地也能拿到完整玻璃。
+
+     必须用经典脚本（不带 type="module"）引入 —— file:// 下模块脚本是 CORS 模式取的，
+     实测动态 import() 直接 ERR_FAILED。经典 <script src> 则正常（实测 onload 通）。
+
+     加 defer：内嵌的图有 4.7 MB，不加会阻塞首屏（head 里的同步脚本、
+     样式表都要等它跑完）。经典 defer 脚本和 module 脚本都进"解析完成后按文档
+     顺序执行"的队列，本标签在 head、模块在 body 末尾，所以它一定先执行 ——
+     这一点是实测确认过的（file:// 下玻璃能起来，就说明模块跑的时候
+     window.__bgData 已经在了）。 -->
+<script src="bg-data.js" defer></script>
+
+<!-- glass-gl 本地副本（vendored，生成物，勿手改）。
+     为什么必须是经典脚本而不是 import('./glass-gl.js')：
+     file:// 下模块脚本是 CORS 模式取的，实测动态 import() 本地模块直接 ERR_FAILED；
+     经典 <script src> 则正常（实测 onload 通）。所以副本里把 ESM 的
+     export 语句换成了 window.createGlass。
+     同样是 defer —— 它要在下面的模块脚本之前执行完，而模块里要用 window.createGlass。
+     升级：powershell -ExecutionPolicy Bypass -File "更新 glass-gl.ps1" -Version 新版本 -->
+<script src="glass-gl.js" defer></script>
+
+<script>
+  /* 背景图 URL：每次启动变一次，换掉 background.jpg 之后普通刷新必然重新取，
+     不可能再拿到浏览器缓存里的旧字节。
+
+     这段必须放在 head 里的同步脚本里，不能挪进模块脚本：模块脚本是 deferred 的，
+     真到首次绘制前才执行。CSS 兜底背景那层用的是 var(--bg-url, url("background.jpg"))，
+     万一模块还没跑浏览器就先绘制了一次，就会用后备值把裸路径请求出去 ——
+     那正是这次要消灭的情况。head 里的同步脚本保证它排在任何一次绘制之前。
+
+     模块脚本那边只读 window.__bgUrl（见 BG_URL），路径只此一处。 */
+  window.__bgUrl = 'background.jpg?v=' + Date.now();
+  document.documentElement.style.setProperty('--bg-url', 'url("' + window.__bgUrl + '")');
+</script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+
+  html,body{
+    width:100%;height:100%;
+    overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;
+    /* 兜底背景：即使 canvas 完全不可用，也能看到这张图。
+       路径走 --bg-url（JS 启动时写成带版本号的同一个文件，见 BG_URL）；
+       没跑起 JS 时用 var 的后备值，行为和以前一样。
+
+       必须拆成长写：var() 放在 background 简写里，替换后的值在计算值阶段
+       重新解析失败，整条声明作废 —— 实测 background-image 直接算成 none、
+       background-size 退回 auto，这层兜底等于没了。长写 + var() 才稳。 */
+    background-color:#0b0d12;
+    background-image:var(--bg-url, url("background.jpg"));
+    background-size:cover;
+    background-position:center;
+    background-repeat:no-repeat;
+    background-attachment:fixed;
+    -webkit-tap-highlight-color:transparent;
+  }
+
+  /* 背景图（同时作为玻璃折射的取样源） */
+  #bgCanvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;display:block;pointer-events:none}
+
+  /* 玻璃渲染层。z-index 必须是 2 而不是 1：
+     底部导航栏(1)的毛玻璃只能模糊到它自己下面那层，玻璃块要压在磨砂底栏之上，
+     否则会被底栏的 backdrop-filter 重新抹平。 */
+  #glassCanvas{position:fixed;inset:0;width:100%;height:100%;z-index:2;display:block;pointer-events:none}
+
+  /* 玻璃边缘彩色描边层（参照 Liquid glass.html 的 #strokeCanvas）
+     排在玻璃渲染层(2)之上、导航文字(4)之下 */
+  #strokeCanvas{position:fixed;inset:0;width:100%;height:100%;z-index:3;display:block;pointer-events:none}
+
+  /* ---------- 顶部标题栏 ---------- */
+  #titlebar{
+    position:fixed;top:0;left:0;right:0;z-index:10;
+    height:calc(56px + env(safe-area-inset-top));
+    padding-top:env(safe-area-inset-top);
+    display:flex;align-items:center;justify-content:center;
+    pointer-events:none;
+    background:linear-gradient(180deg,rgba(0,0,0,.42),rgba(0,0,0,.18) 60%,rgba(0,0,0,0));
+  }
+  /* 标题栏下方分割线 —— 颜色由 JS 按该位置背景亮度自动切换黑/白。
+     「不太显眼」的三个杠杆，按见效大小排：
+       1px 线身（原 2px）—— 实体的量直接砍一半，这是最硬的一刀；
+       辉光 α 从 .45 降到 .16、扩散从 8px 收到 5px —— 原来辉光的 α
+         和边缘一样大，8px 摊开以后比线身还抢眼，是扎眼的真正来源；
+       线身 α 腰斩 —— 只保留还能看出「这是一条分隔」的量。 */
+  #titlebar::after{
+    content:'';position:absolute;left:0;right:0;bottom:0;height:1px;
+    background:linear-gradient(90deg,
+      var(--div-edge, rgba(255,255,255,.20)) 0%,
+      var(--div-core, rgba(255,255,255,.44)) 42%,
+      var(--div-core, rgba(255,255,255,.44)) 58%,
+      var(--div-edge, rgba(255,255,255,.20)) 100%);
+    box-shadow:0 0 5px var(--div-glow, rgba(255,255,255,.16));
+    transition:background .3s ease,box-shadow .3s ease;
+  }
+  #titleWrap{
+    display:flex;align-items:center;gap:10px;
+    user-select:none;-webkit-user-select:none;
+  }
+  #appTitle{
+    color:rgba(255,255,255,.96);
+    font-size:18px;font-weight:700;letter-spacing:2px;
+    transition:text-shadow .25s ease;
+  }
+  /* 标题后的模式标签（液态玻璃） */
+  #modeTag{
+    position:relative;
+    font-size:11px;font-weight:600;letter-spacing:1px;
+    color:rgba(255,255,255,.92);
+    padding:3px 11px;border-radius:10px;
+    white-space:nowrap;
+    /* 未加载 glass-gl 时的降级外观 */
+    background-color:rgba(255,255,255,.16);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(255,255,255,.12);
+    backdrop-filter:blur(8px) saturate(1.5);
+    -webkit-backdrop-filter:blur(8px) saturate(1.5);
+    transition:text-shadow .25s ease,background-color .3s ease;
+  }
+  /* 通过本地服务正常运行时，标签整个不显示 */
+  #modeTag[hidden]{display:none}
+  /* glass-gl 生效后交出外观控制权 */
+  html.glass-ok #modeTag{
+    background-color:transparent;
+    box-shadow:none;
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
+  }
+  /* 玻璃顶部高光，模拟液面反光 */
+  #modeTag::after{
+    content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    background:linear-gradient(160deg,rgba(255,255,255,.30) 0%,rgba(255,255,255,.06) 42%,rgba(255,255,255,0) 70%);
+    opacity:.85;
+  }
+  html.glass-ok #modeTag::after{opacity:.55}
+
+  /* ---------- 液态玻璃按钮 ---------- */
+  .glass-btn{
+    position:fixed;z-index:20;
+    width:40px;height:40px;padding:0;border:0;
+    border-radius:20px;
+    display:flex;align-items:center;justify-content:center;
+    color:rgba(255,255,255,.96);
+    cursor:pointer;
+    user-select:none;-webkit-user-select:none;
+    touch-action:manipulation;
+    pointer-events:auto;
+    /* 未加载 glass-gl 时的降级外观 */
+    background-color:rgba(255,255,255,.16);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(255,255,255,.12);
+    backdrop-filter:blur(10px) saturate(1.5);
+    -webkit-backdrop-filter:blur(10px) saturate(1.5);
+    transition:transform .16s ease,background-color .3s ease;
+  }
+  /* glass-gl 生效后交出外观控制权 */
+  html.glass-ok .glass-btn{
+    background-color:transparent;
+    box-shadow:none;
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
+  }
+  /* 玻璃顶部高光，模拟液面反光 */
+  .glass-btn::after{
+    content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    background:linear-gradient(160deg,rgba(255,255,255,.30) 0%,rgba(255,255,255,.06) 42%,rgba(255,255,255,0) 70%);
+    opacity:.85;
+  }
+  html.glass-ok .glass-btn::after{opacity:.55}
+
+  .glass-btn:hover{transform:scale(1.06)}
+  .glass-btn:active{transform:scale(.94)}
+  .glass-btn:focus-visible{outline:2px solid rgba(255,255,255,.8);outline-offset:3px}
+
+  .glass-btn svg{
+    position:relative;z-index:1;
+    width:20px;height:20px;display:block;
+    transition:filter .25s ease,transform .16s ease;
+  }
+  .glass-btn:hover svg{transform:scale(1.06)}
+
+  #menuBtn{top:calc(8px + env(safe-area-inset-top));left:14px}
+  #searchBtn{top:calc(8px + env(safe-area-inset-top));right:14px}
+
+  /* ---------- 搜索框：标题栏下方的长条胶囊 ---------- */
+  /* 弹出动画动的是 width（0 -> 满宽），不是 transform / opacity。
+     这块玻璃是 glass-gl 画在 glassCanvas 上的，它每帧量 getBoundingClientRect，
+     所以盒子真的变宽，玻璃就真的跟着变宽 —— 是"液态地长出来"。
+     换成 scale + opacity 就不行：玻璃不归元素的 opacity 管，
+     文字淡入的那 300ms 里玻璃会先整块跳出来，再和文字错开。 */
+  :root{
+    --sb-h:48px;                              /* 胶囊高 */
+    --sb-w:min(420px, calc(100vw - 32px));     /* 满宽；窄屏自动收到屏宽减边距 */
+    /* 磨砂半径。现在是 0 —— 搜索框背后不再有高斯模糊，
+       玻璃块折射到的背景保持锐利。
+       用 CSS 的 blur() 而不是 glass-gl 的 blur 参数 —— 后者是 9x9 等权均值盒
+       （不是高斯），而且 setParams 是整个实例一份，没法只给这一个元素。
+       想开回来的话把 0px 改回 2px（当时就是这么一点点）。 */
+    --sb-frost:blur(0px);
+  }
+  #searchBar{
+    position:fixed;z-index:12;
+    top:calc(56px + env(safe-area-inset-top) + 10px);   /* 标题栏(56px)下方 10px */
+    left:50%;transform:translateX(-50%);
+    width:0;height:var(--sb-h);
+    border-radius:calc(var(--sb-h) / 2);
+    overflow:hidden;                 /* 宽度生长时把里面的字裁在胶囊里 */
+    pointer-events:auto;
+    /* 未加载 glass-gl 时的降级外观 */
+    background-color:rgba(255,255,255,.16);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(255,255,255,.12);
+    backdrop-filter:var(--sb-frost) saturate(1.5);
+    -webkit-backdrop-filter:var(--sb-frost) saturate(1.5);
+    /* 打开用 back-out（y>1 那段是过冲），所以是"弹出来"而不是"拉出来"，
+       和底栏玻璃块按下的那条 .34,1.56,.64,1 同一个手family。 */
+    transition:width .34s cubic-bezier(.28,1.24,.45,1);
+  }
+  #searchBar.open{width:var(--sb-w)}
+  /* 收起：纯 ease-in，不带过冲（收尾过冲会显得回弹），而且更短 */
+  #searchBar.closing{
+    width:0;
+    transition:width .22s cubic-bezier(.5,0,.75,0);
+  }
+  #searchBar[hidden]{display:none}   /* 收起后彻底不参与渲染，见 searchClose 的注释 */
+  /* glass-gl 生效后交出外观控制权 —— 只交背景和内阴影，磨砂不交。 */
+  html.glass-ok #searchBar{
+    background-color:transparent;
+    box-shadow:none;
+    /* 这里刻意不是 none。#searchBar 是 z-index:12，压在玻璃渲染层(2)和
+       描边层(3)**之上**，所以它的 backdrop 里就含着那块折射出来的玻璃，
+       磨砂正是磨在玻璃上 —— 这才是「液态玻璃 + 一点高斯模糊」。
+       底栏当初必须把磨砂烤进 bgCanvas，恰恰是因为 #navBar(z1) 在
+       glassCanvas(2) 下面、backdrop-filter 会被玻璃层整块盖回去；
+       搜索框的层序正好反过来，所以 CSS 这条路在这里成立。
+       backdrop-filter 只作用于 backdrop，不含元素自己的内容 ——
+       占位文字和光标仍然是清楚的，糊的只有玻璃和底下的背景。
+       （描边层(3) 也在 backdrop 里，所以边缘那圈描边会跟着一起变柔，
+       这正好像磨砂玻璃后面的边光。） */
+    backdrop-filter:var(--sb-frost);
+    -webkit-backdrop-filter:var(--sb-frost);
+  }
+  /* 玻璃顶部高光，和 .glass-btn / #modeTag 同一套 */
+  #searchBar::after{
+    content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    background:linear-gradient(160deg,rgba(255,255,255,.30) 0%,rgba(255,255,255,.06) 42%,rgba(255,255,255,0) 70%);
+    opacity:.85;
+  }
+  html.glass-ok #searchBar::after{opacity:.55}
+  #searchInput{
+    position:relative;z-index:1;   /* 压在 ::after 高光上面，玻璃在 glassCanvas(2) 上更下面 */
+    display:block;width:100%;height:100%;
+    margin:0;padding:0 22px;border:0;outline:0;background:transparent;
+    font:inherit;font-size:15px;letter-spacing:1px;
+    color:rgba(255,255,255,.96);
+    caret-color:rgba(255,255,255,.96);
+    /* 文字比胶囊晚 100ms 进场：那时宽度已经过冲完、回到满宽，
+       不会看到一个还没长开的框里先挤着一行字。 */
+    opacity:0;transition:opacity .18s ease;
+  }
+  #searchInput::placeholder{color:rgba(255,255,255,.62)}
+  #searchBar.open #searchInput{opacity:1;transition:opacity .18s ease .1s}
+  #searchBar.closing #searchInput{opacity:0;transition:opacity .1s ease}
+  /* 焦点圈由胶囊的玻璃边缘交代，不再画浏览器默认那一圈 */
+  #searchInput:focus{outline:none}
+
+  @media (prefers-reduced-motion:reduce){
+    .glass-btn,.glass-btn svg{transition:none}
+    #searchBar,#searchBar.open,#searchBar.closing{transition:none}
+    #searchInput,#searchBar.open #searchInput{transition:none}
+  }
+
+  /* ---------- 首页功能卡片 ---------- */
+  /* 列数按视口方向切：竖版两列、横版四列。
+     orientation 看的是视口宽高比 —— 手机竖持是 portrait，电脑和横持手机是
+     landscape，正好对上"竖版设备两列、横版设备四列"。
+     注意是视口方向不是设备方向：电脑窗口拖成竖条也会切回两列，这通常正是想要的。 */
+  :root{
+    --card-r:18px;        /* 圆角，必须与 JS 的 CARD_R 一致 */
+    --card-gap:12px;
+  }
+  /* 居中用 left:0/right:0 + margin:auto。原来的注释说不要用
+     left:50% + transform:translateX(-50%)，因为 transform 会形成层叠上下文。
+     现在 #pages 要用 transform 来滑动，所以这条禁令依然成立 ——
+     #pages 自己是那个 transform 的主人，#cards 这里绝不能再开一个。 */
+  #cards{
+    /* absolute 而不是 fixed：现在它在 .page 里，.page 已经是 fixed 且占满视口，
+       relative 到 .page 的坐标系和之前 relative 到视口完全等价，
+       但跟着页面一起被 #pages 的 translate3d 带走。
+       如果保持 fixed，它会脱离 .page 的变换，滑动时卡片就钉在屏幕上不动了。 */
+    position:absolute;
+    left:0;right:0;
+    margin-inline:auto;
+    /* z-index 仍然要写：#pages 形成层叠上下文后，这一条不再需要来压过画布，
+       但保留着——它同时保证 #cards 自己是个层叠上下文，.card 的 z-index:4
+       在它内部才有意义（层内比较）。写成 4 是无副作用的。 */
+    z-index:4;
+    /* 上边让开的不只是标题栏，还有搜索框展开后占的那条位置。
+       搜索框 top = 标题栏 56px + 10px、高 48px，占到 114px；
+       这里再留 10px 间隙，所以是 56 + 68 = 124px。
+       搜索框 z-index 12 在 #cards(4) 上面，不让开就会压在第一行卡上：
+       实测竖版横版都是重叠 42px。 */
+    top:calc(56px + env(safe-area-inset-top) + 68px);
+    bottom:calc(62px + env(safe-area-inset-bottom) + 12px);
+    width:calc(100% - 32px);
+    max-width:1180px;      /* 超宽屏不让单张卡无限拉宽，否则四列能撑到 600px 一张 */
+    display:grid;
+    grid-template-columns:repeat(2, 1fr);
+    gap:var(--card-gap);
+    align-content:start;  /* 卡片贴上边，不被剩余高度拉匀 */
+    /* 刻意不加 overflow —— 一旦成为滚动容器，hover 的放大就会撑出滚动条。
+       .cardTile:hover 时 .card/.cardGlass 会 scale(1.015)，最后一张卡右边缘因此
+       超出网格右边缘：实测 390 宽时多 1.3px、1440 宽时多 2.15px，
+       overflow:auto 就会在网格底部吐出一条横向滚动条（竖向不会，网格比内容高得多）。
+       transform 会扩张可滚动溢出区，这条去不掉，只能让 #cards 不是滚动容器。
+
+       那"极矮窗口放不下"的兜底就不靠滚了，改看数字：
+       上下留白一共 124 + 74 = 198px，横版一行、竖版两行，
+       卡高又被 max-height:200px 封顶，所以放不下需要
+       视口高 < 398（横版）/ < 610（竖版）。
+       2018 年后的手机竖版最小 375x667，装得下；
+       只有 iPhone SE 一代那种 320x568 装不下，会压到底栏上。
+       真要再兜底，就把 .cardTile 的 max-height 改成 min(200px, 26vh) ——
+       那样任何高 >= 438 的视口都装得下（844/900 这些常见尺寸不受影响，
+       26vh 分别是 219/234，都比 200 大，还是取 200）。 */
+  }
+  /* 列数按**宽度**分，不再看横竖屏 —— 平板竖屏以前落在"竖屏"那一档里，
+     两列各 400 多宽，卡片却只有 300 宽（见下面 .cardTile 的说明），
+     一整行右边空出 62~190px，看着就是"整体偏左"。
+
+     阈值取 640px：这是平板的最小宽度。
+       < 640（手机竖屏）  两列两行，和之前一样
+       >= 640             四列一行，横屏手机 / 平板横竖屏都走这一档
+     两档都算过，.cardTile 的 max-height:200px 都不会被触发
+     （<640 时列最宽 298 -> 高 149；>=640 时列最宽 289 -> 高 193），
+     所以卡片永远是正好 3:2、铺满格子。 */
+  @media (min-width:640px){
+    #cards{grid-template-columns:repeat(4, 1fr)}
+  }
+  /* ---------- 页面容器 / 横向切页 ---------- */
+  /* #pages 铺满"标题栏以下、底栏以上"的整片区域，两个 .page 并排各占 100% 宽。
+     滑动靠 transform: translate3d，不动 left/width —— 动 left 会每帧触发重排，
+     而且固定定位的元素在 iOS 上改 left 容易抖。
+     will-change:transform 提前提升成合成层，滑动时才不会现推。
+
+     bottom 停在底栏上沿（62px + 安全区，和 #navItems 的 bottom:10px + 高 52px 对齐），
+     不能是 0。#pages 是 z-index:4，而 #navBar / #navItems 都是 z-index:1 ——
+     那两个不能抬到 4 之上，因为底栏那一套的整个设计就是让文字待在
+     glassCanvas(2)/strokeCanvas(3) 底下（见 :root 那段层序注释），
+     抬上去活动标签就会浮到玻璃块上面，残影效果没了。
+     所以让 #pages 不覆盖底栏那条带子：命中测试自然回到底栏自己身上，
+     视觉上也没有任何接缝 —— 那条带子里只有背景照片和烘进 bgCanvas 的磨砂，
+     两页完全共用，滑动时它是不动的。
+     副作用也是想要的：手指从底栏上起手不会误触发翻页。 */
+  #pages{
+    position:fixed;
+    top:0;left:0;
+    bottom:calc(62px + env(safe-area-inset-bottom));
+    width:100%;
+    z-index:4;              /* 见 HTML 里那段：压过 glassCanvas(2)/strokeCanvas(3) */
+    display:flex;
+    will-change:transform;
+    transform:translate3d(0,0,0);
+    touch-action:pan-y;      /* 横向我们自己处理，竖向仍交给浏览器滚 */
+  }
+  /* 松手吸附 / 点击切页。--page-dx 是手势过程中的实时位移，
+     transition 用 --page-ease 这条带过冲的 S 形曲线（和底栏形变同family）。 */
+  #pages.settling{
+    transition:transform .42s var(--page-ease, cubic-bezier(.42,.1,.58,1));
+  }
+  .page{
+    flex:0 0 100%;
+    min-width:0;            /* 不写的话 flex 项的 min-width:auto 会顶住，页面被撑宽 */
+    position:relative;
+    height:100%;
+  }
+  /* 非当前页不参与命中测试：横向拖动时手指起点多半落在旁边那页的卡片上，
+     不关掉的话会连带把那个按钮的 :active 亮起来。 */
+  .page:not(.current){ pointer-events:none; }
+
+  /* 谱架页的内容区：和 #cards 同样的上下留白，内容居中。 */
+  .pageContent{
+    position:absolute;
+    top:calc(56px + env(safe-area-inset-top) + 68px);
+    bottom:calc(62px + env(safe-area-inset-bottom) + 12px);
+    left:0;right:0;
+    margin-inline:auto;
+    width:calc(100% - 32px);
+    max-width:1180px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .emptyState{
+    font-size:17px;
+    letter-spacing:1px;
+    color:#fff;
+    opacity:.72;
+    text-shadow:var(--shadow-dark, 0 1px 4px rgba(0,0,0,.35));
+    user-select:none;-webkit-user-select:none;
+  }
+
+  /* 一张卡 = 一个网格单元。单元自身刻意不设 z-index：
+     不必要的层叠上下文只会把下面的 .card 再关一层。 */
+  .cardTile{
+    position:relative;
+    width:100%;           /* 关键：不给的话 max-height 会把宽度一起缩掉，见下 */
+    aspect-ratio:3 / 2;
+    max-height:200px;     /* 兜底，正常情况下不会触发（见上面那两行算式） */
+  }
+  /* width:100% 为什么必须写：
+     .cardTile 没写宽度时，grid 拉伸给的是 auto 宽，aspect-ratio 让高度由宽度推出，
+     max-height 把高度夹到 200 之后，浏览器又按同一个比例把宽度缩回 300 ——
+     格子有 362/394/401/496 宽，卡片却只有 300，剩下的就贴在格子左边，
+     整行因此偏左（平板竖屏上空 62~190px）。
+     写死 width:100% 之后宽度是定值，max-height 只夹高度、不再回头改宽度，
+     卡片永远铺满格子，左偏这条路就被堵死了。
+     顺带说明：换成上面那套按宽度的列数之后，这个夹子其实已经不会触发了，
+     留着只是给浏览器缩放、极扁窗口这类意外情况兜个底。 */
+  /* 玻璃矩形。降级外观与 .glass-btn 同一套：磨砂色 + 顶部高光 + 模糊。 */
+  .cardGlass{
+    position:absolute;inset:0;
+    border-radius:var(--card-r);
+    pointer-events:none;
+    background-color:rgba(255,255,255,.16);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(255,255,255,.12);
+    backdrop-filter:blur(10px) saturate(1.5);
+    -webkit-backdrop-filter:blur(10px) saturate(1.5);
+    transition:transform .18s cubic-bezier(.34,1.4,.5,1);
+  }
+  /* glass-gl 生效后交出外观控制权 —— 和 .glass-btn 一样，
+     折射和描边分别由 glassCanvas(2) 和 strokeCanvas(3) 画。
+     玻璃块因此不在 .cardGlass 上，所以 #cards 抬到 z-index:4 也不会挡住折射。 */
+  html.glass-ok .cardGlass{
+    background-color:transparent;
+    box-shadow:none;
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
+  }
+  /* 文字层。z-index:4 现在管的是"在 #cards 这个层叠上下文里，
+     .card 要盖过 .cardGlass"（降级外观的磨砂底就在 .cardGlass 上）。
+     压过 glassCanvas/strokeCanvas 靠的是 #cards 自己的 z-index:4。 */
+  .card{
+    position:absolute;inset:0;z-index:4;
+    padding:0;border:0;border-radius:var(--card-r);
+    background:transparent;
+    display:flex;align-items:center;justify-content:center;
+    font:inherit;font-size:22px;font-weight:600;letter-spacing:2px;
+    color:rgba(255,255,255,.96);
+    cursor:pointer;
+    user-select:none;-webkit-user-select:none;
+    touch-action:manipulation;
+    transition:transform .18s cubic-bezier(.34,1.4,.5,1);
+  }
+  /* 玻璃顶部的液面反光。压在玻璃之上，所以玻璃就绪后仍然留着，只把强度降一档 */
+  .card::after{
+    content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    background:linear-gradient(160deg,rgba(255,255,255,.30) 0%,rgba(255,255,255,.06) 42%,rgba(255,255,255,0) 70%);
+    opacity:.85;
+  }
+  html.glass-ok .card::after{opacity:.55}
+  .card:focus-visible{outline:2px solid rgba(255,255,255,.85);outline-offset:3px}
+  /* 按下时玻璃和文字一起缩放。规则写在 .cardTile 上而不是 .card 上 ——
+     .card 的 :hover/:active 会被 tile 里这两条按优先级压掉，分开写容易对不上。 */
+  .cardTile:hover .card,
+  .cardTile:hover .cardGlass{transform:scale(1.015)}
+  .cardTile:active .card,
+  .cardTile:active .cardGlass{transform:scale(.975)}
+
+  /* ---------- 底部导航栏 ---------- */
+  /* 底栏尺寸只跟着两个按钮走，不占满整条屏宽。
+     --nav-w 依赖按钮的实际排版宽度（文字宽度随字体变化），只能由 JS 量出来后写入；
+     在写入之前 #navBar 保持 visibility:hidden，避免先闪一条满宽的底栏再收窄。
+     高度/内缩是纯静态的，用变量收敛到一处。 */
+  :root{
+    --nav-h:52px;          /* 底栏高：按钮 44px，上下各留 4px */
+    --nav-pill-h:44px;     /* 玻璃块高，比底栏略小 */
+    --nav-gap:8px;         /* 两个按钮之间的距离 */
+    /* 指示块动画的放大峰值。1.18 是这么来的：44 * 1.18 = 51.9，
+       正好等于底栏高 —— 涟漪涨到最高点时刚好填满底栏，不会溢出到栏外。
+       再大就会盖过底栏边缘。 */
+    --nav-morph-scale:1.18;
+    /* 按住不放时的鼓起量。比峰值小一点：按下只是预告"我要过去了"，
+       真正到位后的峰值留给形变动画，不然松手瞬间会先缩一下再涨。 */
+    --nav-press-scale:1.1;
+    /* 拖动中的鼓起量。手指一按一拖就涨到这么鼓，停在半空跟着走。
+       卡在按下的 1.1 和落位峰值 1.18 之间，两头都留出变化。 */
+    --nav-drag-scale:1.12;
+  }
+  /* 层序（低 → 高）：
+       0 bgCanvas        背景 + 烘进去的底栏高斯模糊
+       1 #navBar         磨砂底栏本体
+       1 #navItems       两个文字  ← 与 #navBar 同级，靠 DOM 顺序压在栏上
+       2 #glassCanvas    玻璃块的折射（glass-gl 画的）
+       3 #strokeCanvas   玻璃块的描边环
+     也就是文字在玻璃块的**下面**：活动标签那一格被玻璃块整个盖住，
+     只剩一块透出背景折射的玻璃片；没选中的标签在块外面，清晰可读。
+     磨砂底栏和文字仍然必须拆成两个元素 —— 文字若塞进 #navBar，
+     #navBar 的 z-index 会形成层叠上下文，就再也钻不到玻璃块下面去了。
+
+     为什么盖得住：glassCanvas 在玻璃块范围内是不透明的（实测：把
+     #navIndicator 本体从 8% 白改成透明、乃至纯黑不透明，量出来的
+     文字区像素完全一样 —— 都被它涂掉了）。
+     这不是 bug，是 glass-gl 的折射只能采样 bgCanvas，而 bgCanvas 里
+     只有背景图、不含 DOM 文字。玻璃透镜不知道文字的存在，
+     所以它盖住之后不会"透出字"，只会透出背景。
+     文字挪到下面后残留 19% 的对比度（对照：完全隐藏时 0%），
+     看着像字被玻璃散射后剩的一点残影。
+
+     这里不用 backdrop-filter —— 高斯模糊已经被 drawFrostBar() 烘进 bgCanvas
+     的这个圆角矩形里了（见 renderBackground）。
+     这么做有两个原因，都不是为了省事：
+       一) glass-gl 采样的是 bgCanvas。模糊烘进去之后，玻璃块折射到的
+          天然就是底栏正在显示的那张高斯模糊图 —— 真实磨砂玻璃就是这样：
+          玻璃块透出的是被磨砂层散射过的内容，不是背后的原始画面。
+       二) 不依赖 backdrop-filter，就不受合成器实现差异的影响。
+     所以 #navBar 只需要一层薄薄的半透明色 + 一圈玻璃棱边。 */
+  #navBar{
+    position:fixed;left:50%;transform:translateX(-50%);
+    bottom:calc(10px + env(safe-area-inset-bottom));
+    width:var(--nav-w, 0px);height:var(--nav-h);z-index:1;
+    border-radius:26px;pointer-events:none;visibility:hidden;
+    /* --nav-tint / --nav-edge / --nav-shade / --nav-ring 由 JS 按该区域背景亮度一起切换。
+       模糊已经在底下的 bgCanvas 里，这里只叠很薄的一层半透明色和棱边 ——
+       底色一深，底栏就从"半透明毛玻璃"变成实色板了。
+       可见度主要靠那一圈棱边（顶高光/底暗边/外描边）勾出玻璃的厚度。 */
+    background-color:var(--nav-tint, rgba(0,0,0,.12));
+    box-shadow:
+      inset 0  1px 0 var(--nav-edge,  rgba(255,255,255,.24)),
+      inset 0 -1px 0 var(--nav-shade, rgba(0,0,0,.12)),
+      0 0 0 1px var(--nav-ring, rgba(255,255,255,.12));
+    transition:background-color .3s ease,box-shadow .3s ease;
+  }
+  /* 宽度由内容决定（两个按钮的排版宽度），再整体水平居中。
+     z-index 与 #navBar 同为 1：#navBar 在 DOM 里排在前面，
+     同级按文档序绘制，所以文字压在底栏上、又被玻璃块(2/3)盖住。 */
+  #navItems{
+    position:fixed;left:50%;transform:translateX(-50%);
+    bottom:calc(10px + env(safe-area-inset-bottom));
+    height:var(--nav-h);z-index:1;
+    display:flex;align-items:center;justify-content:center;gap:var(--nav-gap);
+    border-radius:26px;
+    /* 拖动要的是"手指按住就粘住"，浏览器的手势识别必须让路：
+       touch-action:none 关掉滚动/双击缩放，页面本身 overflow:hidden 也没得滚。
+       user-select 防止拖动时把"首页"两个字选中。 */
+    touch-action:none;
+    -webkit-user-select:none;user-select:none;
+  }
+  /* 命中区横向扩到整个底栏。#navItems 自身只有两个按钮那么宽（156），
+     底栏 172，两侧各 8px 余量按不到 —— 手指落在边缘就抓不住块了。
+     空盒子照样能接事件，事件冒泡上来 target 就是 #navItems。 */
+  #navItems::before{
+    content:'';position:absolute;
+    left:calc(var(--nav-gap) * -1);right:calc(var(--nav-gap) * -1);
+    top:0;bottom:0;
+  }
+  /* 玻璃块本体不可见，只提供矩形给 glass-gl 去折射背景。
+     上下居中于底栏，所以底栏一改高度这里自动跟随。
+
+     visibility:hidden 直到 glass-gl 的归属被判定（initGlass 的 finally）——
+     否则每次刷新都会闪一下：CDN 加载完成前它显示为 .18 白 + blur(10px) 的
+     亮白磨砂胶囊，glass-ok 一加上就变成 .08 白 + 无模糊的折射透镜，
+     玻璃块区域实测均差 28.4（0-255），肉眼是一次明显的明暗跳变。
+     隐藏期间 getBoundingClientRect 仍返回真实矩形，不影响 glass-gl 注册与渲染。 */
+  #navIndicator{
+    position:absolute;left:0;width:0;
+    top:calc((var(--nav-h) - var(--nav-pill-h)) / 2);
+    height:var(--nav-pill-h);
+    border-radius:calc(var(--nav-pill-h) / 2);pointer-events:none;
+    visibility:hidden;
+    /* 降级外观（file:// 或 CDN 失败时）。不需要 backdrop-filter：
+       玻璃块始终落在底栏范围内，脚下的 bgCanvas 已经是高斯模糊图了。 */
+    background-color:rgba(255,255,255,.14);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.42),inset 0 -1px 0 rgba(255,255,255,.12);
+    transition:left .28s ease,width .28s ease,
+               transform .15s cubic-bezier(.34,1.56,.64,1);
+    /* 拖动态的缩放。默认值在 :root 的 --nav-drag-scale，
+       只有"半路接住一块正在形变的玻璃"时会临时被内联值盖掉 ——
+       那时块正鼓在形变途中（比如 1.16），如果直接换成拖动量 1.12，
+       手指按下去的一瞬间块会缩一下，方向感又断了。
+       所以拖动态引这个变量而不是 --nav-drag-scale 本身。 */
+    --drag-scale:var(--nav-drag-scale,1.12);
+  }
+  /* 按住：玻璃块先鼓一下，手指一落就有反应，不用等 click。
+     曲线用 back-out（.34,1.56,.64,1），y>1 的那段就是"过冲"，
+     所以是弹到位而不是硬停 —— Q 弹的手感主要来自这条曲线。
+
+     时长 .46s -> .15s：按住这一下原来要 460ms 才鼓到 1.1，
+     而且松手（navPressOff）走的是同一条过渡，来回 920ms ——
+     这是整条时间轴上最大的一段黏滞，手指已经抬起来了块还在慢慢缩。
+     过冲量由曲线决定、和时长无关，所以缩到 150ms 之后
+     照样是弹到位，但"啪"一下就完了，不粘手。 */
+  #navIndicator.press{ transform:scale(var(--nav-press-scale,1.1)); }
+  /* 拖动中：块跟手平移（--tx 由 JS 写），同时鼓到 --drag-scale。
+     正常手势它等于 --nav-drag-scale 1.12；半路接手时是块当时的大小。
+     transform 过渡必须摘掉：上面那条 .46s 的 back-out 留着，手指一动
+     块要落后半拍，拖起来是"拽着橡皮筋"而不是"抓着块"。 */
+  #navIndicator.drag{
+    transform:translateX(var(--tx,0px)) scale(var(--drag-scale,1.12));
+    transition:left .28s ease,width .28s ease;
+  }
+  /* glass-gl 生效后只留一层很薄的釉面，折射交给 canvas */
+  html.glass-ok #navIndicator{
+    background-color:rgba(255,255,255,.08);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.45);
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
+  }
+  /* 形变动画：等比例放大一圈 -> 平移 -> 恢复原大小，一条时间轴一条曲线走完。
+     只动 transform，不动 left/width —— 盒子始终就是目标按钮那么大，
+     位移和放大交给 transform，所以任何时刻都是等比的，不会出现"被拉宽"的中间态。
+     transform-origin 是盒子中心，放大时四个方向同时往外扩，像一圈涟漪。
+
+     --dx 是"旧中心 - 新中心"，0% 时靠它把盒子放回原来那个按钮上。
+     --s0 是"按下时已经鼓到多少"，0% 从那里起，衔接按下的那一段不会先缩回 1 再涨。
+     .morph 期间必须把 left/width 的过渡关掉：那个过渡会和 keyframes 里的
+     translate 叠加，位移变成两倍。
+
+     这里只有涨和落两段，不做余振：涨到 --nav-morph-scale 再顺势收回 1，
+     收回那段靠同一条 S 曲线的减速尾巴收住。
+
+     曲线 cubic-bezier(.3,.15,.35,1)，时长 460 -> 300ms。
+     换之前那条是 cubic-bezier(.42,.1,.58,1)，仍然是 S 形（先加速后减速，
+     这是之前特意要的），但两头都拖得太长，读着黏：
+       起步斜率 0.24，10% 时间只走 4%、25% 才走 17%
+       峰值速度 1.64x 却落在 48%，太靠后，一多半时间都在减速
+     现在这条实测
+       起步斜率 0.50（一按就走，是原来的两倍）
+       10% 走 8%   25% 走 33%   50% 走 75%   75% 走 95%
+       峰值速度 1.97x，提前到 27%
+     同样的 82px 位移，峰值速度 293 -> 538 px/s（时长和曲线各出一半力）。
+     保留"先加速再减速"这个骨架，只是把两头掐短。
+
+     峰值时刻 45% -> 32%，跟着峰值速度一起挪：块鼓到最大的时候
+     正好是它挪得最快的时候，两件事合成一下，不再是"先慢慢鼓、再慢慢滑"。
+     32% of 300ms = 96ms，比原来的 207ms 早一半多。
+
+     代价（要知道）：位移和缩放共用一条 transform，也就共用这条曲线，
+     缩放和位移没法各走各的节奏（要那样得把 translate 和 scale 拆成
+     两个独立 CSS 属性各挂一条动画，矩阵不变、外观不变）。 */
+  @keyframes navMorph{
+    0%  { transform:translateX(var(--dx,0px)) scale(var(--s0,1)); }
+    32% { transform:translateX(0) scale(var(--nav-morph-scale)); }
+    100%{ transform:translateX(0) scale(1); }
+  }
+  #navIndicator.morph{
+    animation:navMorph 300ms cubic-bezier(.3,.15,.35,1);
+    transition:none;
+  }
+  /* 拖动松手专用：不涨，而且不等。
+     手指放开时块已经鼓在 1.12，如果接着涨到 1.18 再收回，
+     那一下"啪"的变大跟并排发生的位移叠在一起 —— 手指是往那边去的，
+     块却先胀了一下，像被弹了一下，方向感就断了。
+     所以这里不设"停在 --s0 不动"的中点：一段走完，边滑边收。
+     中点那个写法（0%->55% 纯位移、55%->100% 才缩）看着像"先落位再收场"，
+     实测是：位移在前 90ms 就走完了，块却要干等到 187ms 才开始缩 ——
+     拖到位松手的话位移还是 0，整段就是白等 190ms，手感就是"松手有延迟"。
+     一段式没有这个空档，手指一放开立刻在动。
+     时长比 .morph 短：形变要把"加速-减速"整段铺开，300ms；
+     收尾只是回到原状，190ms 够了，手指松开后不该再干等那么久。
+     曲线跟 .morph 用同一条，两种入口的手感才是一套；
+     起步斜率 0.50，手指一放开立刻就在动，不会像对称 ease-in-out
+     （cubic-bezier(.42,0,.58,1)，起步斜率 0.02）那样先死滞一下再走。 */
+  @keyframes navSettle{
+    0%  { transform:translateX(var(--dx,0px)) scale(var(--s0,1)); }
+    100%{ transform:translateX(0) scale(1); }
+  }
+  #navIndicator.settle{
+    animation:navSettle 190ms cubic-bezier(.3,.15,.35,1);
+    transition:none;
+  }
+  .navItem{
+    position:relative;z-index:1;
+    height:44px;padding:0 20px;border:0;border-radius:22px;
+    background:transparent;
+    font:inherit;font-size:15px;font-weight:600;letter-spacing:2px;
+    color:rgba(255,255,255,.72);
+    cursor:pointer;user-select:none;-webkit-user-select:none;
+    touch-action:manipulation;
+    transition:color .25s ease,transform .16s ease;
+  }
+  /* 标签已经画进 bgCanvas（见 drawNavLabels），DOM 里这两个 <button> 只剩
+     无障碍语义和几何尺寸 —— 视觉上要让位给画布上那份，否则字会重影。
+     选择器比 .navItem 特异性高，所以放在后面还是前面都压得住。 */
+  html.nav-labels-in-canvas .navItem{color:transparent;text-shadow:none}
+  .navItem[aria-current="page"]{color:#fff}
+  .navItem:active{transform:scale(.94)}
+  .navItem:focus-visible{outline:2px solid rgba(255,255,255,.85);outline-offset:-4px}
+  @media (prefers-reduced-motion:reduce){
+    #navIndicator{transition:none}
+    #navIndicator.press,
+    #navIndicator.drag{transform:none}   /* 不要鼓、不要跟手，直接换位 */
+    #navIndicator.morph,
+    #navIndicator.settle{animation:none}  /* 直接落位，不做动画 */
+    .navItem{transition:none}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bgCanvas"></canvas>
+<canvas id="glassCanvas"></canvas>
+<canvas id="strokeCanvas"></canvas>
+
+<header id="titlebar">
+  <div id="titleWrap">
+    <h1 id="appTitle">看谱Pro</h1>
+    <span id="modeTag" hidden>兼容模式</span>
+  </div>
+</header>
+
+<button id="menuBtn" class="glass-btn" type="button" aria-label="菜单" title="菜单">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <line x1="4" y1="7"  x2="20" y2="7"></line>
+    <line x1="4" y1="12" x2="20" y2="12"></line>
+    <line x1="4" y1="17" x2="20" y2="17"></line>
+  </svg>
+</button>
+
+<button id="searchBtn" class="glass-btn" type="button" aria-label="搜索" title="搜索">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <circle cx="11" cy="11" r="6.5"></circle>
+    <line x1="15.8" y1="15.8" x2="20" y2="20"></line>
+  </svg>
+</button>
+
+<!-- 搜索框：长条胶囊的液态玻璃。width 从 0 生长到 --sb-w，
+     玻璃由 glass-gl 画在 glassCanvas 上，会跟着盒子一起长开。
+     收起时是 display:none，量不出宽高，描边层和 glass-gl 就都不会再画它。 -->
+<div id="searchBar" role="search" hidden>
+  <input id="searchInput" type="text" inputmode="search" autocomplete="off"
+         spellcheck="false" placeholder="输入要查找的乐谱名称" aria-label="输入要查找的乐谱名称">
+</div>
+
+<!-- 首页功能卡片。
+     每张卡拆成"玻璃矩形 + 文字"两个元素，和底栏同一个道理，但结论相反：
+        .cardGlass  z-auto  只提供矩形让 glass-gl 去折射背后的背景，自身不可见；
+        .card       z-index:4 文字层，必须读得清。
+     卡片不能沿用底栏那套"把文字画进 bgCanvas 一起被折射"的做法：底栏是故意让
+     活动标签被玻璃盖住、只剩一点残影（见 #navBar 上面的注释），那是特意要的效果；
+     而卡片上的文字就是它全部的内容，盖住就等于没有卡片。
+
+     为什么不是"按钮里套个 span"：按钮一旦做缩放动画就形成层叠上下文，里面的
+     span 再也钻不到玻璃上面去 —— 按下时文字会突然沉到玻璃底下、松手又弹回来。
+     所以玻璃和文字各自留在自己的层里，按下时两边一起缩放，谁也不包着谁。
+
+     层序（低 → 高）：
+       0 bgCanvas   背景
+       2 glassCanvas  玻璃块折射（卡片也画在上面，只是靠 .cardGlass 提供矩形）
+       3 strokeCanvas 描边环
+       4 #cards      卡片网格整体 —— 文字层就靠这一层压过上面两块画布
+      #cards 的 z-index 不能省，理由见上面那段注释。 -->
+<!-- 页面容器：首页和谱架横向并排，整条一起translateX 滑动。
+     为什么不用两套 fixed 元素各自显示/隐藏：那樣切页是"淡入淡出"，
+     两个页面在视觉上互相替换，看不出是同一块板子在滑。
+     这里两个 .page 真实并排（各自 100% 宽），滑动时能看见前一个被推走。
+
+     #pages 自己是 fixed + transform，transform 会形成层叠上下文，
+     所以里面的东西整体停在 #pages 这一层（z-index:4）上 —— 这正好是我们要的：
+     卡片文字要压过 glassCanvas(2)/strokeCanvas(3)，而 #pages 是 4。
+     代价是 .card 自己的 z-index:4 在这个上下文里不再有额外作用，保留即可。
+
+     层级必须是 pages > pageHome > cards 和 pages > pageScore 三层，不能拍平。
+     少写一个 </section> 的话，HTML 解析器会把 #pageScore 塞进 #pageHome 里面，
+     那个多出来的 </div> 会把整叠元素一次性弹掉 —— 结果是两页挤在同一格子里，
+     滑动时看着像"滑到空白"，而且第二页跟着第一页一起位移，拖都拖不出来。 -->
+<div id="pages">
+
+<!-- 首页功能卡片。
+     每张卡拆成"玻璃矩形 + 文字"两个元素，和底栏同一个道理，但结论相反：
+        .cardGlass  z-auto  只提供矩形让 glass-gl 去折射背后的背景，自身不可见；
+        .card       z-index:4 文字层，必须读得清。
+     卡片不能沿用底栏那套"把文字画进 bgCanvas 一起被折射"的做法：底栏是故意让
+     活动标签被玻璃盖住、只剩一点残影（见 #navBar 上面的注释），那是特意要的效果；
+     而卡片上的文字就是它全部的内容，盖住就等于没有卡片。
+
+     为什么不是"按钮里套个 span"：按钮一旦做缩放动画就形成层叠上下文，里面的
+     span 再也钻不到玻璃上面去 —— 按下时文字会突然沉到玻璃底下、松手又弹回来。
+     所以玻璃和文字各自留在自己的层里，按下时两边一起缩放，谁也不包着谁。
+
+     层序（低 → 高）：
+       0 bgCanvas   背景
+       2 glassCanvas  玻璃块折射（卡片也画在上面，只是靠 .cardGlass 提供矩形）
+       3 strokeCanvas 描边环
+       4 #cards      卡片网格整体 —— 文字层就靠这一层压过上面两块画布
+      #cards 的 z-index 不能省，理由见上面那段注释。 -->
+<section class="page" id="pageHome" data-page="0">
+<section id="cards" aria-label="功能入口">
+  <div class="cardTile">
+    <div class="cardGlass" data-idx="0" aria-hidden="true"></div>
+    <button class="card" type="button" data-idx="0">节拍器</button>
+  </div>
+  <div class="cardTile">
+    <div class="cardGlass" data-idx="1" aria-hidden="true"></div>
+    <button class="card" type="button" data-idx="1">演出行程</button>
+  </div>
+  <div class="cardTile">
+    <div class="cardGlass" data-idx="2" aria-hidden="true"></div>
+    <button class="card" type="button" data-idx="2">谱架</button>
+  </div>
+  <div class="cardTile">
+    <div class="cardGlass" data-idx="3" aria-hidden="true"></div>
+    <button class="card" type="button" data-idx="3">收藏乐谱</button>
+  </div>
+</section>
+</section>
+
+<!-- 谱架页面：先做一个空状态占位 -->
+<section class="page" id="pageScore" data-page="1">
+  <div class="pageContent">
+    <div class="emptyState">这里还没有乐谱</div>
+  </div>
+</section>
+
+</div>
+
+<!-- 底部导航：磨砂底栏(1) 与文字(1) 拆成两个元素，玻璃块(2/3) 压在文字上面。
+     文字故意放在玻璃块**下面**：活动标签那一格被玻璃块整个盖住，
+     只剩一块透出背景折射的玻璃片（层序和代价见 #navBar 上面的注释）。
+     若把文字塞进 #navBar，#navBar 的 z-index 会形成层叠上下文，
+     文字就钻不到玻璃块下面去了。 -->
+<div id="navBar" aria-hidden="true"></div>
+
+<nav id="navItems" aria-label="主导航">
+  <!-- 玻璃块本体不可见，只提供矩形给 glass-gl 去折射背景 -->
+  <div id="navIndicator" aria-hidden="true"></div>
+  <button class="navItem" type="button" data-idx="0" aria-current="page">首页</button>
+  <button class="navItem" type="button" data-idx="1">谱架</button>
+</nav>
+
+<script type="module">
+const bgCanvas    = document.getElementById('bgCanvas');
+const glassCanvas = document.getElementById('glassCanvas');
+const strokeCanvas= document.getElementById('strokeCanvas');
+const bgCtx       = bgCanvas.getContext('2d');
+
+/* 渲染倍率。描边是细环，边缘锐度最吃分辨率 —— 实测环的 10-90% 边缘过渡宽度：
+     1x -> 13.0 CSSpx（糊成一团）   2x -> 2.0 CSSpx（清晰）
+   原来的 min(dpr,2) 会把 3x 设备（多数手机/平板）压回 2x 再放大显示，描边发虚，
+   所以上限提到 3；再用总像素预算兜底，避免超大窗口下三张全屏画布吃爆显存。 */
+const DPR_MAX = 3;
+const DPR_PIXEL_BUDGET = 24e6;   // 三张 RGBA 全屏画布约 12 字节/像素 -> 约 288 MB 上限
+const dpr = (function(){
+  let d = Math.min(window.devicePixelRatio || 1, DPR_MAX);
+  while (d > 1 && innerWidth * innerHeight * d * d > DPR_PIXEL_BUDGET) d -= 0.5;
+  return d;
+})();
+const BG_IMAGE = 'background.jpg';   // 换背景只需替换这个文件
+
+/* 换掉这个文件之后，普通刷新有可能还拿到浏览器缓存里的旧字节：
+   server.mjs 只发了 Cache-Control: no-cache，没发 ETag / Last-Modified，
+   浏览器没有验证器可对。URL 上带一个每次启动都变的参数，缓存键必然不同，
+   拿到的就是磁盘上那份。
+
+   同一个文件被引用了两处 —— CSS 里 body 的兜底背景，和 canvas 的取样源。
+   两处都得带：只给 canvas 加的话，屏幕上是新图（canvas 不透明、盖满视口），
+   但 CSS 那层兜底和 canvas 画出来之前的一帧仍然是旧图。
+
+   版本号本身在 head 的同步脚本里算好（见那段注释），这里只取来用，
+   免得路径和时机在两个地方各写一遍。
+
+   file:// 下优先用内嵌的 data:URL（bg-data.js 提供）：裸路径是跨源的，
+   会污染画布，getImageData 和 texImage2D 全抛 SecurityError，
+   玻璃和描边层都活不下来（见 head 里那个 <script src> 的注释）。
+   data:URL 缺失时才退回裸路径 —— 也就是回到"会降级"的老样子。 */
+const BG_URL = (location.protocol === 'file:')
+             ? (window.__bgData || BG_IMAGE)
+             : (window.__bgUrl || BG_IMAGE);
+const GLASS_RADIUS = 20;
+
+/* glass-gl 的加载路径。本地副本是主路径，不是备用。
+   原先只有 CDN 一条路，而那个 CDN 是间歇性慢的 —— 实测同一份代码
+   有时 2 秒就绪、有时 9 秒还没起来；离线、被代理拦、被广告拦截插件挡，
+   玻璃就一直没有。这正是"有时没有玻璃"的一条独立成因。
+   本地副本走 head 里的 <script src defer>，执行后挂在 window.createGlass 上。
+
+   CDN 保留为兜底：万一 glass-gl.js 丢了，file:// 和 http 下都还能靠它工作
+   （实测两种协议下都实测过，2 秒就绪）。
+   别和"file:// 下 import 本地模块被 CORS 拦"搞混 —— 被拦的只是本地文件路径，
+   https 的 URL 不受这条限制，所以 CDN 兜底在 file:// 下同样有效。 */
+const GLASS_LOCAL = 'glass-gl.js';
+const GLASS_CDN   = 'https://esm.sh/glass-gl@0.4.0';
+
+/* 背景图内嵌为 data:URL —— 关键：data:URL 不会污染 canvas。
+   若改为 "background.jpg"，双击打开(file://)时画布被污染，
+   glass-gl 上传背景纹理时抛 SecurityError，液态玻璃会完全失效。
+   内嵌由 bg-data.js 提供（head 里的 <script src>），生成脚本是「重新生成 bg-data.ps1」。 */
+
+/* 描边粗细系数：参考文件的小控件用 0.55，这里按需求逐级加粗
+   0.9 -> 1.3 让描边更粗更实 */
+const STROKE_SCALE = 1.8;
+
+/* 「本地模式」标签比按钮小得多，描边按比例收细，否则会盖住胶囊 */
+const TAG_RADIUS = 10;        // 标签高约 22px，半高即 10，正好是胶囊
+const TAG_STROKE_SCALE = 0.9;
+
+/* 背景调色 —— 默认 0，即原样显示，不对任何特定图片做补偿。
+   如果你的背景偏亮导致白色文字看不清，可以微调下面两个值。 */
+const BG_DARKEN   = 0;   // 整体压暗 0~1
+const BG_VIGNETTE = 0;   // 暗角强度 0~1
+
+/* 磨砂半径（CSS px）—— 底栏的模糊和玻璃块的折射共用这一个值。
+   模糊烘进 bgCanvas 之后，glass-gl 采样 bgCanvas 拿到的就是这张模糊图，
+   所以玻璃块折射的正是底栏正在显示的内容，两边天然一致，不存在两个半径。
+
+   为什么这么小而不是常见的 20~30：磨砂玻璃之所以看得出磨砂，靠的是背后有
+   细节被散射掉。半径一大，细节先没了一半，模糊就等于不存在 ——
+   底栏会变成一块比周围均匀压暗的圆角矩形，也就是实色板。
+   拿背景图栏外那块锐利内容实测（相邻像素 RMS）：
+     源 59.31 → 2px 10.96 → 4px 3.07 → 10px 0.63
+   10px 那一档已经抹平（底栏内中线剖面 200 199 199 … 197 … 199 200，
+   栏内均值 0.7762、栏外 0.7708，完全一样），10px 的底栏是实色板。
+   往小调，背景结构透出来的多，底栏才真的"半透明"。
+   换到细节丰富的背景后，这个值可以往上调。 */
+/* 底栏那层磨砂的半径（CSS px），烘进 bgCanvas。0 = 不磨砂。
+   卡片（CARD_FROST_R）和搜索框（--sb-frost）现在也都是 0，
+   整页只剩玻璃块的折射，没有高斯模糊了。想开回来把 0 改成 2。 */
+const FROST_R = 0;
+const NAV_BAR_R = 26;   // 底栏圆角，写进 bgCanvas 时要和 CSS 里的 --nav-r 一致
+
+const appTitle = document.getElementById('appTitle');
+const modeTag  = document.getElementById('modeTag');
+const buttons  = [document.getElementById('menuBtn'), document.getElementById('searchBtn')];
+
+/* ---------- 底部导航栏 + 液态玻璃指示块 ----------
+   #navIndicator 本体是一块透明的盒子，折射由 glass-gl 画在 glassCanvas 上。
+   glass-gl 的渲染循环每帧对每个注册元素重新 getBoundingClientRect()，
+   且 register() 支持逐元素 radius，所以宽度逐帧变化的形变动画它跟得上，
+   圆角也不用和两个按钮共用 20。 */
+const navBar   = document.getElementById('navBar');
+const navItems = document.getElementById('navItems');
+const navPill  = document.getElementById('navIndicator');
+const navBtns  = [...navItems.querySelectorAll('.navItem')];
+
+const NAV_PILL_H = 44;          // 与 CSS --nav-pill-h 一致
+const NAV_BAR_PAD = 8;          // 底栏左右比按钮各多留的余量；与 CSS --nav-gap 同值
+const NAV_RADIUS = NAV_PILL_H / 2;   // 短边一半，正好是胶囊
+const NAV_STROKE_SCALE = 1.3;   // 比按钮略细：形变时环会被拉宽，太粗会显脏
+/* 这两个数会在 navPlace 里写成内联 animationDuration，覆盖 CSS 里的时长，
+   所以改了 CSS 别忘了改这里，反之亦然。 */
+const MORPH_MS = 300;           // 形变总时长；关键帧 32% 处是放大峰值（见 --nav-morph-scale）
+const SETTLE_MS = 190;          // 拖动松手的收尾时长。一段式，没有中点，停不了（见 navSettle）
+/* 这两个值和 CSS 里 .morph / .settle 的 animation 时长是同一件事的两个副本：
+   CSS 写的是首次挂载时的值，JS 这两个常量在 navPlace 里以内联 animationDuration
+   覆盖它。改时长必须两边一起改，否则表现以 JS 为准、CSS 里的数字变成骗人的。 */
+/* 按住 / 拖动的鼓起量也不在这里写死：数值只在 :root（--nav-press-scale /
+   --nav-drag-scale），形变的起始缩放 --s0 则是量出来的（见 navPlace）。 */
+
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+/* 按下超过这个位移（px）才算"拖"，否则仍按普通点击处理 ——
+   手抖一下不该把当前按钮弹出去。 */
+const DRAG_START_PX = 4;
+/* 吸附判定的方向权重：整段滑动 >= 行程的 40% 就顺着方向走，
+   哪怕手指还没推到两按钮的中线。快速轻扫也能换页，不必推到底。
+   调小 = 更难靠方向触发、几乎只认松手位置；调大 = 轻轻一动就跳。
+
+   注意一个事实：现在只有两个按钮，中线正好在行程的 50%，
+   而这个阈值 40% < 50% —— 方向规则永远比位置规则先触发，
+   位置规则只在"拖得极短又刚好过中线"这种夹缝里才轮得到。
+   想让"松手位置"当主、方向只兜底，把这个数调到 0.5 以上；
+   等以后按钮超过两个（行程被拉开），位置规则自然就主起来了。 */
+const DRAG_DIR_RATIO = 0.4;
+
+let navActive = 0;
+/* 正在拖：{id, x0, tx0, took, lo, hi, tx, raw, moved}；null = 没在拖 */
+let navDrag = null;
+/* 刚拖完。用来吃掉紧跟着 pointerup 的那个 click ——
+   拖动已经换过位了，按钮自己的 click 再跑一遍就是第二次形变。 */
+let navJustDragged = false;
+
+/* 底栏宽度 = 两个按钮的排版宽度 + 左右余量。
+   文字宽度随实际字体而变，只能量出来 —— CSS 里写死会在换字体/换语言时失配。
+   #navItems 自身无内边距且 width 由内容决定，所以它的 offsetWidth 就等于按钮总宽，
+   两者同心居中即可，底栏正好在按钮左右各留出 NAV_BAR_PAD。 */
+function navFitBar(){
+  const w = navItems.offsetWidth + NAV_BAR_PAD * 2;
+  if(!w) return;
+  navBar.style.setProperty('--nav-w', w + 'px');
+  navBar.style.visibility = 'visible';
+}
+
+/* 把指示块落到第 i 个按钮上。
+   animate=true 时走动画：盒子（left/width）一次性设成目标按钮，
+   视觉上的位移和放大全交给 transform，所以整条时间轴上都是等比的，
+   不存在被拉宽的中间态。
+
+   settle=true 用"不涨"那条时间轴（.settle），给拖动松手用：
+   手指一路把块拖过去，块已经鼓着，这时再涨一下才落位会很突兀。
+   点击换位走 .morph，那一下的弹起是想要的。
+
+   位移量取"当前视觉中心 - 目标中心"，两边都用 getBoundingClientRect：
+   它包含 transform，所以上一次动画进行到一半被打断时，接着的位置也是对的
+   （computed left 只能拿到布局位置，动画中途会跳）。 */
+function navPlace(i, animate, settle){
+  const btn = navBtns[i];
+  if(!btn) return;
+  navFitBar();
+  const s = navPill.style;
+  if(animate && !reduceMotion.matches){
+    const bL = btn.offsetLeft, bW = btn.offsetWidth;
+    const cRect = navItems.getBoundingClientRect();   // offsetLeft 的参照系
+    /* 含 transform 的实际位置。拖动松手时必须"带着 --tx 量"：
+       .drag 摘掉之后量到的是布局位置，算出来的 --dx 就少了手指拖过的那一段，
+       块会在落位动画开头先跳回去一截再滑过来。 */
+    const pRect = navPill.getBoundingClientRect();
+    const dx = +((pRect.left + pRect.width / 2) - (cRect.left + bL + bW / 2)).toFixed(2);
+    /* --s0 = 松手这一刻块实际的缩放，直接量，不记。
+       量的时候 .press / .drag 还没摘（下面才摘），所以量到的正是手指放开时
+       看得见的那个大小：点击是 1.1、拖动是 1.12、半路接手的是形变途中那个值、
+       键盘换位（压根没按过）是 1。四条路一条公式，不用判断来路。
+       不给的话 0% 硬写 scale(1)：块会先"啪"地缩回原大小再涨，
+       正好把最该被看见的松手瞬间吃掉了。 */
+    const s0 = +(pRect.width / navPill.offsetWidth).toFixed(4);
+    s.setProperty('--dx', dx + 'px');
+    s.setProperty('--s0', s0);
+    // 落点先写成内联值：动画结束后撤掉类就是这个位置，不会闪
+    s.left = bL + 'px'; s.width = bW + 'px';
+    navPill.classList.remove('press');               // 动画接管 transform
+    navPill.classList.remove('drag');
+    s.removeProperty('--tx');
+    s.removeProperty('--drag-scale');               // 下一次拖动回到 1.12
+    navPill.classList.remove('morph');
+    navPill.classList.remove('settle');
+    void navPill.offsetWidth;                      // 强制回流以重启动画
+    navPill.style.animationDuration = (settle ? SETTLE_MS : MORPH_MS) + 'ms';
+    navPill.classList.add(settle ? 'settle' : 'morph');
+  }else{
+    navPill.classList.remove('press');
+    navPill.classList.remove('drag');
+    s.removeProperty('--tx');
+    s.removeProperty('--drag-scale');
+    navPill.classList.remove('morph');
+    navPill.classList.remove('settle');
+    s.setProperty('--s0', 1);
+    navPill.style.left  = btn.offsetLeft  + 'px';
+    navPill.style.width = btn.offsetWidth + 'px';
+    /* 首次放置必须关掉过渡，否则底栏玻璃块永远拿不到液态玻璃。
+       块在 CSS 里是 width:0，而上面那条 transition 里带着 width .28s ——
+       内联写 74px 会让它从 0 慢慢过渡过去，initGlass 在这几毫秒内就去注册了，
+       那时量到的宽度还是 0，visibleGlassEls 把它当"看不见"滤掉，
+       glass-gl 就再也不画它（注册只做一次，之后不重扫）。
+       实测过：注册那一刻内联宽度 74px、计算宽度 0px、高 44px。
+       只在宽度还是 0（首次放置）时关过渡，窗口缩放那条 280ms 滑动照旧。 */
+    if(navPill.offsetWidth === 0){
+      const keep = s.transition;
+      s.transition = 'none';
+      navPill.style.left  = btn.offsetLeft  + 'px';
+      navPill.style.width = btn.offsetWidth + 'px';
+      void navPill.offsetWidth;          // 强制回流，让新值在"无过渡"状态下落地
+      s.transition = keep;
+    }
+  }
+  const 换位了 = i !== navActive;
+  navActive = i;
+  navBtns.forEach((b,k)=> k===i ? b.setAttribute('aria-current','page')
+                                 : b.removeAttribute('aria-current'));
+  /* 标签是画在 bgCanvas 里的，选中态一变（颜色）就得重画那张图。
+     整张 renderBackground 会连背景照片一起重铺，所以只在真换位时调 ——
+     形变动画 460ms 里插一次全屏重绘会卡一帧，而那时字又没变。 */
+  if(换位了) navPaintLabels();
+}
+navPill.addEventListener('animationend', e=>{
+  if(e.animationName === 'navMorph')  navPill.classList.remove('morph');
+  if(e.animationName === 'navSettle') navPill.classList.remove('settle');
+});
+
+/* 按下 / 松开：用 pointer 而不是 mouse+touch 两套，
+   触摸设备上 pointerdown 立刻触发，配合 #navItems 的 touch-action:none
+   不会被 300ms 延迟拖住那一拍。 */
+function navPressOn(){
+  if(reduceMotion.matches) return;
+  if(navPill.classList.contains('morph')) return;   // 形变中不叠加，动画的 transform 说了算
+  if(navPill.classList.contains('settle')) return;  // 收尾中同理
+  navPill.classList.add('press');
+}
+function navPressOff(){
+  if(!navPill.classList.contains('press')) return;  // 没按过 / 已经放过了
+  navPill.classList.remove('press');
+  /* 这里不需要留任何"刚才按到多大"的记忆：起跳缩放由 navPlace 直接量
+     getBoundingClientRect 拿到（--s0）。.press 刚摘掉，量到的是过渡的
+     起点值，正是手指放开那一刻的大小。
+     早先是用 navFromS 记着、靠 setTimeout(0) 清 —— pointerup 和 click
+     同一批派发才赶得上，中间隔一个宏任务就记丢了，起跳会变成 1，
+     块先"啪"地缩一下再涨，峰值那一下的弹起就没了。 */
+}
+
+/* 按钮中心的 x，相对 navItems（也就是 offsetLeft 的参照系）。
+   吸附判定和拖动夹取都拿它当尺子。 */
+function navCenters(){
+  return navBtns.map(b => b.offsetLeft + b.offsetWidth / 2);
+}
+
+/* 玻璃块中心的可拖范围：卡在第一个和最后一个按钮的中心之间，
+   拖不出底栏。返回值是相对"当前盒子中心"的偏移上下限。 */
+function navTxRange(){
+  const c = navCenters(), cur = c[navActive];
+  return [c[0] - cur, c[c.length - 1] - cur];
+}
+
+/* 松手吸到哪个按钮 —— 位置和方向一起说话：
+     位置：块中心越过相邻两按钮的中线，就落到那边（慢慢推过去，看得见自己在哪）。
+     方向：整段滑动 >= 行程的 DRAG_DIR_RATIO，就顺着方向直接走（快速轻扫也能换）。
+   位置规则在下面先算，方向规则可以覆盖它 —— 手一甩，不该因为"还没到中线"而赖着不动。 */
+function navPickTarget(tx){
+  const c = navCenters(), n = c.length, pos = c[navActive] + tx;
+  let t = 0;
+  for(let k = 0; k < n - 1; k++) if(pos > (c[k] + c[k + 1]) / 2) t = k + 1;
+  const travel = Math.abs(c[n - 1] - c[0]) || 1;
+  if(Math.abs(tx) >= travel * DRAG_DIR_RATIO) t = tx > 0 ? n - 1 : 0;
+  return t;
+}
+
+function navDragStart(e){
+  if(reduceMotion.matches) return;                 // 不要动效的场合：只留点击换位
+  if(e.button > 0) return;                         // 只认左键 / 触摸 / 笔
+  /* lo/hi 一次算好存起来：offsetLeft 每次读都逼一次布局重排，
+     pointermove 一次读一次没必要 —— 拖动期间底栏的排版不会变。 */
+  const [lo, hi] = navTxRange();
+  let tx0 = 0, took = false;
+  /* 形变进行中也要接得住：抓在半路里的块应该能接着拖，
+     而不是把这下输入丢掉（丢掉的话 460ms 内任何按下都没反应，手感是"卡"）。
+     从 computed transform 里读出它此刻的位移和大小当起点，并且**立刻**把
+     --tx 落成这个位移：只记在变量里不写进样式的话，块会先"啪"地弹回
+     布局位置（形变进行中那一下能差出三四十像素），再被手指拽回来。
+     同理把当时的大小写进 --drag-scale：否则 .drag 一上，transform 从
+     形变途中的 1.16 跳到 1.12，手指按下去的瞬间块缩一下。 */
+  if(navPill.classList.contains('morph') || navPill.classList.contains('settle')){
+    const t = getComputedStyle(navPill).transform;
+    if(t && t !== 'none'){
+      const m = new DOMMatrixReadOnly(t);
+      // 取两位就够：matrix 里是浮点尾数，全写进 --tx 会拖出一长串小数
+      tx0 = +Math.max(lo, Math.min(hi, m.m41)).toFixed(2);   // 动画里的 translateX
+      navPill.style.setProperty('--drag-scale', +m.a.toFixed(4));   // 动画里的 scale
+    }
+    took = true;
+    navPill.classList.remove('morph');             // transform 交给 .drag 接管
+    navPill.classList.remove('settle');
+  }
+  navDrag = { id: e.pointerId, x0: e.clientX, tx0, took, lo, hi, tx: tx0, raw: 0, moved: false };
+  if(took){
+    navPill.classList.add('drag');
+    navPill.style.setProperty('--tx', tx0 + 'px');
+  }else{
+    navPill.style.removeProperty('--drag-scale');   // 正常手势：拖动量就是 1.12
+    navPressOn();
+  }
+  /* move/up 挂在 window 上，不用 setPointerCapture：
+     指针捕获会把兼容鼠标事件（含 click）也改派到捕获元素上，
+     按钮自己的 click 处理器就再也收不到了。这里靠 window 兜住
+     "手指划出底栏"的情况，再加一个 blur 兜住"划出窗口"。 */
+  window.addEventListener('pointermove', navDragMove);
+  window.addEventListener('pointerup',   navDragEnd);
+  window.addEventListener('pointercancel', navDragEnd);
+  window.addEventListener('blur', navDragBlur);
+}
+function navDragMove(e){
+  if(!navDrag || e.pointerId !== navDrag.id) return;
+  const raw = e.clientX - navDrag.x0;
+  if(raw === navDrag.raw) return;
+  if(!navDrag.moved){
+    if(Math.abs(raw) < DRAG_START_PX) return;      // 还没过启动阈值：仍然只是"按住"
+    navDrag.moved = true;
+    if(!navDrag.took){
+      navPill.classList.remove('press');
+      navPill.classList.add('drag');
+    }
+  }
+  const d = navDrag;
+  d.raw = raw;
+  d.tx = +Math.max(d.lo, Math.min(d.hi, d.tx0 + raw)).toFixed(2);
+  navPill.style.setProperty('--tx', d.tx + 'px');
+}
+function navDragEnd(e){
+  if(!navDrag || (e && e.pointerId !== navDrag.id)) return;
+  window.removeEventListener('pointermove', navDragMove);
+  window.removeEventListener('pointerup',   navDragEnd);
+  window.removeEventListener('pointercancel', navDragEnd);
+  window.removeEventListener('blur', navDragBlur);
+  const d = navDrag; navDrag = null;
+  if(!d.moved){
+    if(d.took){
+      /* 半路抓住又没拖：本来就只打算去 navActive，直接落地收场，
+         别让块带着 --tx 停在半空。 */
+      navPlace(navActive, false);
+    }else{
+      navPressOff();                                // 没拖动 = 普通点击，交给 click
+    }
+    return;
+  }
+  navJustDragged = true;
+  /* 换位与否必须在 navPlace **之前**判掉，目标也要连着一起存下来。
+     navPlace 会顺手把 navActive 写成目标值，事后再比 `目标 !== navActive`
+     永远为假 —— 玻璃块倒是照样挪过去了，页面不跟，看着就像"只有一半生效"。
+     而且 navPlace 内部会把 d.tx / --tx 收拾干净，事后再算 navPickTarget
+     也拿不回松手那一瞬间的位置了，两个毛病叠一起，就是这个现象。 */
+  const 目标 = navPickTarget(d.tx);
+  const 换位 = 目标 !== navActive;
+  /* 换位时还带着 .drag / --tx：navPlace 量的 getBoundingClientRect 含 transform，
+     算出来的 --dx 才是"手指现在松在这儿"到目标中心的整段距离。
+     .drag 和 --tx 由 navPlace 内部摘掉。
+     第三个参数 true = 走"不涨"那条时间轴。 */
+  navPlace(目标, true, true);
+  /* 底栏上拖出一个"换位"手势时，页面也切过去；纯回弹（没换位）就不切。 */
+  if(换位) pageGo(目标);
+  /* click 跟 pointerup 同一批事件里派发，一定赶在这个宏任务之前，
+     所以上面那句 return 能吃到；读完就清。 */
+  setTimeout(()=>{ navJustDragged = false; }, 0);
+}
+/* 指针被系统收走（切窗口、来电话、浏览器接管手势）：按"松手在当前位置"处理，
+   不能让块僵在半空。 */
+function navDragBlur(){ navDragEnd(null); }
+
+navBtns.forEach((b,i)=>{
+  b.addEventListener('click', ()=>{
+    if(navJustDragged) return;                      // 刚拖完，别再形变一次
+    if(i === navActive) return;
+    /* 切页：指示块自己走它那条形变时间轴（navPlace），
+       页面走 pageGo 的那条。两者互不干涉 ——
+       指示块动的是自己的 left/transform，页面动的是 #pages 的 transform，
+       同一个手指事件里两条动画并行跑，视觉上是"玻璃块滑过去，页面也跟着滑"。 */
+    navPlace(i, true);
+    pageGo(i);
+  });
+});
+navItems.addEventListener('pointerdown', navDragStart);
+
+/* ---------- 页面容器 / 横向切页 ---------- */
+/* 两页并排，滑动靠 #pages 的 translateX。跟手 + 松手吸附。
+
+   和底栏玻璃块那套拖动是同一个思路，但这里刻意不复用它的代码：
+   底栏那块要在"按住 / 拖动 / 形变中"三种状态之间来回接力，还要照顾
+   getBoundingClientRect 含 transform 这类细节；页面只有"跟手 / 吸附"两态，
+   硬套过去只会把简单的事写复杂。
+
+   三个常量：
+     启动阈值 6px —— 比底栏的 4px 大一点。页面滑动是整块板子动，
+       阈值太小的话点卡片时手抖一下就把页面拖走了。
+     判定距离 取屏宽的 22% —— 经典的手势阈值，太小会误切，太大要划很久。
+     甩动速度 0.45 px/ms —— 快速轻扫也能过，不一定要划够 22%。 */
+const PAGE_START_PX = 6;
+const PAGE_FLICK_VX = 0.45;      // px/ms
+
+const pages    = document.getElementById('pages');
+const pageEls  = [...pages.querySelectorAll('.page')];
+const PAGE_N   = pageEls.length;
+
+/* 当前页。和 navActive 是两个独立的量：底栏指示块可以停在两页之间
+   （形变动画途中），页面索引则永远是整数。 */
+let pageActive = 0;
+
+/* 位移用百分比而不是 px：窗口尺寸变化时无需重算，
+   而且 translate3d 的百分比是按自身宽度算的，正好就是一页的宽度。
+   滑动过程中改成用 px（见 pageSet），松手吸附才用百分比。 */
+function pageOffsetX(px){
+  const w = pages.clientWidth || innerWidth;
+  return -(pageActive * w) + px;
+}
+function pageSet(px, settling){
+  pages.classList.toggle('settling', !!settling);
+  /* 手势过程中直接写 px —— 每帧算一次百分比也没差，但 px 少一次取整，
+     松手瞬间不会因为四舍五入抖一下。 */
+  if(px == null) pages.style.transform = 'translate3d(' + (-pageActive * 100) + '%,0,0)';
+  else           pages.style.transform = 'translate3d(' + pageOffsetX(px) + 'px,0,0)';
+}
+
+/* 切到第 i 页。标题栏的文字是应用名（看谱Pro），不跟页面换 ——
+   所以这里只管 .current、指示块和吸附动画。 */
+function pageGo(i, animate){
+  i = Math.max(0, Math.min(PAGE_N - 1, i));
+  const changed = i !== pageActive;
+  pageActive = i;
+  pageEls.forEach((el,k)=> el.classList.toggle('current', k === i));
+  if(animate === false || reduceMotion.matches){
+    pages.classList.remove('settling');
+    pageSet(null);
+  }else if(animate){
+    pageSet(null, true);
+  }else if(changed){
+    pageSet(null, true);
+  }
+}
+
+pageEls.forEach((el,i)=> el.classList.toggle('current', i === 0));
+
+/* 手势状态。存 startX 和 lastX+lastT：松手时用最近一小段的平均速度判定，
+   比用"总位移 / 总时长"准得多 —— 手指按住不动再松开，
+   总时长会被拉长到几秒，算出来速度接近 0，甩不动也切不了。 */
+let pageDrag = null;
+let pageSwallowClick = false;   // 拖过之后要吞掉这一次 click
+
+pages.addEventListener('pointerdown', e=>{
+  pageDrag = { id:e.pointerId, startX:e.clientX, lastX:e.clientX, lastT:e.timeStamp,
+               raw:0, vx:0, moved:false, clamped:false };
+  window.addEventListener('pointermove', pageDragMove);
+  window.addEventListener('pointerup',   pageDragEnd);
+  window.addEventListener('pointercancel', pageDragEnd);
+});
+
+function pageDragMove(e){
+  const d = pageDrag;
+  if(!d || e.pointerId !== d.id) return;
+  const raw = e.clientX - d.startX;
+  if(!d.moved){
+    if(Math.abs(raw) < PAGE_START_PX) return;
+    d.moved = true;
+    pages.classList.remove('settling');       // 手势接管，去掉过渡
+  }
+  const dt = e.timeStamp - d.lastT;
+  /* 只在样本间隔合理时才更新速度：两帧之间隔了几百毫秒（掉帧、事件合并），
+     那个平均值没有意义，宁可留上一帧的。 */
+  if(dt > 0 && dt < 100){
+    d.vx = (e.clientX - d.lastX) / dt;
+    d.lastX = e.clientX; d.lastT = e.timeStamp;
+  }
+  /* 到边界的橡皮筋：第一页往左拖、最后一页往右拖，只让跟到 40% 屏宽就停，
+     再多也不动。停了以后照样要弹回，不能顺着这个位移翻页 ——
+     所以这里额外记一个 clamped，pageDragEnd 见到它就直接吸附回原页。 */
+  const w = pages.clientWidth || innerWidth;
+  let x = raw;
+  if(pageActive === 0 && x < -w * 0.4){ x = -w * 0.4; d.clamped = true; }
+  if(pageActive === PAGE_N - 1 && x > w * 0.4){ x = w * 0.4; d.clamped = true; }
+  d.raw = x;
+  pageSet(x, false);
+}
+function pageDragEnd(e){
+  const d = pageDrag;
+  if(!d || (e && e.pointerId !== d.id)) return;
+  window.removeEventListener('pointermove', pageDragMove);
+  window.removeEventListener('pointerup',   pageDragEnd);
+  window.removeEventListener('pointercancel', pageDragEnd);
+  pageDrag = null;
+  if(!d.moved) return;                          // 没拖过 = 普通点击，放行
+
+  /* 拖过了：这一次手势之后的 click 要吞掉，否则手指抬起时会在
+     手指下面那个卡片上触发点击（点了"谱架"却只是切了页）。 */
+  pageSwallowClick = true;
+  setTimeout(()=>{ pageSwallowClick = false; }, 0);
+
+  const w = pages.clientWidth || innerWidth;
+  /* 松手前手指已经停住一会儿的，把速度作废 —— 否则"快划一下、
+     停住再松手"会按刚才那一瞬的速度误判成甩动。 */
+  const vx = (e && e.timeStamp - d.lastT > 90) ? 0 : d.vx;
+
+  /* 判定：划够 22% 屏宽，或者甩得够快。方向就是位移的正负：
+     往左（负）翻下一页，往右（正）回上一页。
+     四条必须按"距离先、速度后"顺序独立判断，不能写成
+     raw<=far || (vx<阈值 && raw<0) 这种混合式 ——
+     far 一旦带上符号，正负两半就会互相吃掉（之前把右拖一小段
+     判成"下一页"，就是这个符号错误留下的）。 */
+  const far = w * 0.22;
+  let target = pageActive;
+  if     (d.clamped)                        target = pageActive;      // 拖到头了，弹回
+  else if(d.raw <= -far)                    target = pageActive + 1;
+  else if(d.raw >=  far)                    target = pageActive - 1;
+  else if(vx <= -PAGE_FLICK_VX && d.raw < 0) target = pageActive + 1;
+  else if(vx >=  PAGE_FLICK_VX && d.raw > 0) target = pageActive - 1;
+  target = Math.max(0, Math.min(PAGE_N - 1, target));
+
+  if(target !== pageActive){
+    pageActive = target;
+    pageEls.forEach((el,k)=> el.classList.toggle('current', k === target));
+    /* 指示块跟着去。animate=true 让它走形变时间轴，
+       和手指方向一致，读起来是"你把玻璃块甩到了那边"。 */
+    navPlace(target, true);
+  }
+  pageSet(null, true);                          // 吸附回整页位置
+}
+pages.addEventListener('click', e=>{ if(pageSwallowClick){ e.stopPropagation(); e.preventDefault(); } }, true);
+
+/* 窗口尺寸变化：百分比会自动跟，但"划够 22%"的判定用的是实时宽度，
+   没有缓存，所以这里不需要重算任何东西。只把过渡状态清掉，
+   免得正在吸附的时候窗口一变，过渡终点算错。 */
+window.addEventListener('resize', ()=>{ pages.classList.remove('settling'); });
+
+/* 键盘可达性：左右方向键切页（底栏按钮本身已经能 Tab 到）。 */
+window.addEventListener('keydown', e=>{
+  if(e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if(e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+  /* LTR：← 往回退一页（索引减小），→ 往前翻一页。 */
+  const t = e.key === 'ArrowLeft' ? pageActive - 1 : pageActive + 1;
+  if(t < 0 || t >= PAGE_N || t === pageActive) return;
+  e.preventDefault();
+  navPlace(t, true);
+  pageGo(t);
+});
+
+/* ---------- 首页功能卡片 ---------- */
+/* 处理函数还是占位，等功能规格。理由和汉堡菜单一样：
+   先把位置、层序、玻璃和按压手感定下来，行为等规格到了再接。 */
+document.querySelectorAll('.card').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    if(pageSwallowClick) return;
+    /* 「谱架」这一张是唯一有明确去向的：它和底栏的谱架是同一个页面，
+       从哪进都得落在同一页上，所以走和底栏完全相同的那条路。 */
+    if(btn.dataset.idx === '2'){
+      navPlace(1, true);
+      pageGo(1);
+      return;
+    }
+    console.log('打开卡片：' + btn.textContent.trim());
+  });
+});
+
+/* ---------- 搜索框 ---------- */
+const searchBar   = document.getElementById('searchBar');
+const searchInput = document.getElementById('searchInput');
+const SEARCH_H = 48;              // 与 CSS --sb-h 一致
+const SEARCH_R = SEARCH_H / 2;    // 胶囊：圆角就是高的一半
+
+const CARD_R = 18;                 // 与 CSS --card-r 一致
+/* 卡片玻璃块背后那层磨砂的半径（CSS px），烘进 bgCanvas。
+   0 = 完全不磨砂（现在就是 0：卡片背后的背景照片保持锐利，
+   折射采样到的也是锐利图）。底栏那层同样是 0，见 FROST_R。 */
+const CARD_FROST_R = 0;
+
+/* 每个玻璃元素带一个自己的圆角 = 自身短边的一半。
+   玻璃体和描边环用同一个值：两边的着色器都会 min(半径, 半短边) 夹一次，
+   所以超出也不会变形，只是白写。 */
+const glassEls = [
+  { el: buttons[0], radius: GLASS_RADIUS, strokeScale: STROKE_SCALE },
+  { el: buttons[1], radius: GLASS_RADIUS, strokeScale: STROKE_SCALE },
+  { el: modeTag,   radius: TAG_RADIUS,     strokeScale: TAG_STROKE_SCALE },
+  { el: navPill,   radius: NAV_RADIUS,     strokeScale: NAV_STROKE_SCALE },
+  /* 描边倍数取 1.3（和底栏玻璃块同值）而不是按钮那套 1.8：
+     描边环是按元素短边放大的，48px 高的胶囊用 1.8 会甩出一圈很粗的边。 */
+  { el: searchBar, radius: SEARCH_R,      strokeScale: NAV_STROKE_SCALE },
+  // 首页功能卡片：玻璃块由 glassCanvas 画，描边环由 strokeCanvas 画
+  { el: document.querySelector('.cardGlass[data-idx="0"]'), radius: CARD_R, strokeScale: STROKE_SCALE },
+  { el: document.querySelector('.cardGlass[data-idx="1"]'), radius: CARD_R, strokeScale: STROKE_SCALE },
+  { el: document.querySelector('.cardGlass[data-idx="2"]'), radius: CARD_R, strokeScale: STROKE_SCALE },
+  { el: document.querySelector('.cardGlass[data-idx="3"]'), radius: CARD_R, strokeScale: STROKE_SCALE }
+];
+
+/* 只把"当前真的看得见"的元素交给玻璃。
+   「兼容模式」标签在本地服务下是 display:none，
+   隐藏元素量出来宽高都是 0，交给 glass-gl 只会分配一块无效区域。 */
+function visibleGlassEls(){
+  return glassEls.filter(g=>{
+    const r = g.el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+}
+
+let glass = null;
+let strokeGL = null;
+let bgImg = null;
+
+/* ---------- 背景绘制 ---------- */
+function sizeCanvas(){
+  const w = Math.max(1, Math.round(innerWidth  * dpr));
+  const h = Math.max(1, Math.round(innerHeight * dpr));
+  bgCanvas.width = glassCanvas.width = strokeCanvas.width = w;
+  bgCanvas.height = glassCanvas.height = strokeCanvas.height = h;
+  if(strokeGL) strokeGL.viewport(0,0,w,h);
+}
+
+function drawFallbackBg(){
+  bgCtx.setTransform(1,0,0,1,0,0);
+  const w=bgCanvas.width, h=bgCanvas.height;
+  const g=bgCtx.createLinearGradient(0,0,w,h);
+  g.addColorStop(0,'#1b2a4a');
+  g.addColorStop(.5,'#243b63');
+  g.addColorStop(1,'#0f1626');
+  bgCtx.fillStyle=g;
+  bgCtx.fillRect(0,0,w,h);
+}
+
+function drawImageBg(img){
+  bgCtx.setTransform(1,0,0,1,0,0);
+  const cw=bgCanvas.width, ch=bgCanvas.height;
+  bgCtx.clearRect(0,0,cw,ch);
+
+  // cover 铺满
+  const scale=Math.max(cw/img.width, ch/img.height);
+  const dw=img.width*scale, dh=img.height*scale;
+  const dx=(cw-dw)/2, dy=(ch-dh)/2;
+  bgCtx.drawImage(img,dx,dy,dw,dh);
+
+  // 轻微压暗
+  if(BG_DARKEN > 0){
+    bgCtx.fillStyle = `rgba(0,0,0,${BG_DARKEN})`;
+    bgCtx.fillRect(0,0,cw,ch);
+  }
+
+  // 暗角
+  if(BG_VIGNETTE > 0){
+    const vg=bgCtx.createRadialGradient(cw*.5,ch*.45,Math.min(cw,ch)*.25,cw*.5,ch*.5,Math.max(cw,ch)*.75);
+    vg.addColorStop(0,'rgba(0,0,0,0)');
+    vg.addColorStop(1,`rgba(0,0,0,${BG_VIGNETTE})`);
+    bgCtx.fillStyle=vg;
+    bgCtx.fillRect(0,0,cw,ch);
+  }
+}
+
+/* ---------- 底栏的磨砂高斯：直接烘进 bgCanvas ---------- */
+/* 两块小画布，只覆盖底栏附近，不开全屏：底栏 172x52 加 2 个 2 倍半径的余量，
+   dpr=3 时也只有约 800x450，开全屏要多占几百 MB。 */
+const frostCv  = document.createElement('canvas');
+const frostCv2 = document.createElement('canvas');
+const frostCtx  = frostCv.getContext('2d');
+const frostCtx2 = frostCv2.getContext('2d');
+
+/* 把源矩形按镜像方式铺满整块画布。
+   为什么必须镜像：ctx.filter 的模糊核探出内容边界时取到的是透明像素，
+   实测一张不透明均匀灰 blur(16px) 之后四角 alpha 只剩 67/255、边缘中点 125/255 ——
+   直接淡出的话，紧贴画布底边 10px 的底栏下方会出现一条发亮的带。
+   镜像之后边界外仍有像素，模糊核不会碰到透明，边界处也就没有淡出。
+
+   (sx,sy,sw,sh) 是源矩形在 bgCanvas 里的位置；
+   (x,y) 是它在**本地画布**坐标系里的左上角 —— 两者不能混用，
+   偏移量必须按本地坐标算，否则三块镜像全落在画布外、画出来是空的。 */
+function reflectFill(ctx, src, sx, sy, sw, sh, x, y){
+  const xs = [{d:x-sw, f:true}, {d:x, f:false}, {d:x+sw, f:true}];
+  const ys = [{d:y-sh, f:true}, {d:y, f:false}, {d:y+sh, f:true}];
+  for(const tx of xs) for(const ty of ys){
+    ctx.save();
+    ctx.setTransform(tx.f ? -1 : 1, 0, 0, ty.f ? -1 : 1,
+                     tx.d + (tx.f ? sw : 0), ty.d + (ty.f ? sh : 0));
+    ctx.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+    ctx.restore();
+  }
+}
+
+/* 把 bgCanvas 上某一个圆角矩形区域就地做一次真高斯模糊，结果写回 bgCanvas。
+   矩形参数用 CSS px，进去自己乘 dpr。
+
+   为什么不用 glass-gl 自己的 blur 参数：那个是**全局**的 ——
+   setParams 是 Object.assign 到同一个参数对象上，渲染循环里 uBlur 只从那一个
+   对象读（register 的逐元素选项里只有 radius 被用到）。设成非 0，
+   标题栏那两块按钮和底栏玻璃块会一起变糊，没法只给卡片加。
+
+   改折射源图就只影响这一个元素：glass-gl 采样的是 bgCanvas，
+   源图糊了它折射到的就是糊的，观感和玻璃块自带 blur 一样，但能按元素分开做。 */
+function frostRegion(rect, radCss, blurCss){
+  if(!(rect.width > 0) || !(rect.height > 0)) return;
+
+  const cw = bgCanvas.width, ch = bgCanvas.height;
+  const bx = rect.left*dpr, by = rect.top*dpr, bw = rect.width*dpr, bh = rect.height*dpr;
+  const rad = radCss*dpr;
+
+  /* 余量取 2 个半径：模糊核在 2σ 处的权重已降到 exp(-8)≈0.03%，
+     留这么宽就不会有可见的边缘痕迹。 */
+  const m = Math.ceil(2 * blurCss * dpr);
+  const ox = bx - m, oy = by - m, ow = bw + m*2, oh = bh + m*2;
+
+  /* 源区被画布边界截断时，源和目标同步收窄，保持 1:1 不缩放。
+     （drawImage 对越界源矩形会按比例调整目标，那会让模糊图和周围的锐利背景错位。） */
+  const cx = Math.max(0, ox), cy = Math.max(0, oy);
+  const cw1 = Math.min(cw, ox+ow), ch1 = Math.min(ch, oy+oh);
+  const sw = cw1 - cx, sh = ch1 - cy;
+  if(!(sw > 0) || !(sh > 0)) return;
+  const kx = cx - ox, ky = cy - oy;   // 内容在本地画布里的左上角
+
+  if(frostCv.width !== ow || frostCv.height !== oh){ frostCv.width = frostCv2.width = ow; frostCv.height = frostCv2.height = oh; }
+  frostCtx.setTransform(1,0,0,1,0,0);
+  frostCtx.clearRect(0,0,ow,oh);
+  reflectFill(frostCtx, bgCanvas, cx, cy, sw, sh, kx, ky);
+
+  /* 1) 真高斯。ctx.filter='blur(Npx)' 走 Skia 的可分离高斯
+        （CSS backdrop-filter / filter:blur() 用的也是同一套），
+        不是 glass-gl 着色器里那个 9x9 等权均值盒 —— 盒模糊的频响是方形的，
+        会在玻璃块折射出的画面上留下方块状痕迹。
+        N 在画布像素空间生效，所以 CSS px 的半径要乘 dpr。
+        源和目标分两块画布，避免同画布自绘时读到已写过的内容。 */
+  frostCtx2.setTransform(1,0,0,1,0,0);
+  frostCtx2.clearRect(0,0,ow,oh);
+  frostCtx2.filter = `blur(${(blurCss*dpr).toFixed(2)}px)`;
+  frostCtx2.drawImage(frostCv, 0, 0);
+  frostCtx2.filter = 'none';
+
+  /* 2) 只把这个圆角矩形贴回去 —— 裁剪同时把外面的余量全部丢掉，
+        所以镜像补出来的边不会露出到画面上。 */
+  bgCtx.save();
+  bgCtx.setTransform(1,0,0,1,0,0);
+  bgCtx.filter = 'none';
+  bgCtx.beginPath();
+  if(bgCtx.roundRect) bgCtx.roundRect(bx, by, bw, bh, rad);
+  else bgCtx.rect(bx, by, bw, bh);
+  bgCtx.clip();
+  bgCtx.drawImage(frostCv2, kx, ky, sw, sh, cx, cy, sw, sh);
+  bgCtx.restore();
+}
+
+function drawFrostBar(){
+  if(!(FROST_R > 0)) return;          // 和 drawFrostCards 同一个开关
+  frostRegion(navBar.getBoundingClientRect(), NAV_BAR_R, FROST_R);
+}
+
+/* 四张功能卡片：一点点磨砂。
+   半径比底栏大 1px：卡片面积是底栏那块的 6 倍（54k vs 9k 像素），
+   同样的模糊核摊到这么大的面上，"一点点"看着更明显一点。
+   想调就改 CARD_FROST_R 这一个数，改成 0 就完全没有磨砂。 */
+function drawFrostCards(){
+  if(!(CARD_FROST_R > 0)) return;
+  for(const el of document.querySelectorAll('.cardGlass')){
+    const b = el.getBoundingClientRect();
+    if(!(b.width > 0) || !(b.height > 0)) continue;
+    /* 宽高取 offsetWidth/offsetHeight（未变换的布局盒），不用 rect 的：
+       rect 里含 hover 的 scale(1.015) 和按下的 scale(0.975)，
+       按它取会把放大后的框烘进去，缩回原尺寸时边上就露出一圈没糊到的锐边。
+       位置则要用 rect 的中心来摆 —— rect 带 transform，盒子本身没有，
+       两者只能这样合。 */
+    frostRegion({
+      left:   b.left + b.width /2 - el.offsetWidth /2,
+      top:    b.top  + b.height/2 - el.offsetHeight/2,
+      width:  el.offsetWidth,
+      height: el.offsetHeight
+    }, CARD_R, CARD_FROST_R);
+  }
+}
+
+/* 底栏两个标签：画进 bgCanvas，而不是留在 DOM 上。
+   这是"文字也要有折射效果"唯一能做到的办法 ——
+   glass-gl 折射时只采样 background（这里传的 bgCanvas），
+   而 bgCanvas 里只有画出来的东西，DOM 文字它根本不知道。
+   所以把字先画进这张图，玻璃块折射时就会连着字一起处理，
+   和真实玻璃透镜压在字上一样。
+
+   实测要分清两件事（同一张图，玻璃层在/藏，逐段互相关）：
+     · 字确实跟着玻璃走了 —— 换位重画、折射跟着块走都对，
+       玻璃层开/关时块内 93.6% 的像素变了（最大 128 级）。
+     · 但"掰弯"只发生在玻璃块的最外圈。glass-gl 的位移是
+       lens = cuv + (uv-cuv) * (1 - pow(lensField, curve) * refraction)，
+       lensField = 1 - dist/md，而 md = min(半宽, 半高) = 22px（胶囊的半高），
+       所以块正中最平的那块核心有 15px 半径，|x|<=15 位移恒为 0。
+       "首页"两字占 |x|<=17，落在平区里 —— 差分测出来位移 0.00px。
+       实测到的 ±2.5px 都在 x0-9 / x65-74，那是背景照片的边缘，不是字。
+       想要字真的弯，只能把 curve 调小、refraction 调大（全局，标题栏那两块
+       玻璃会跟着变），或者把标签挪到块边缘（两个 tab 的布局不允许）。
+
+   字画进 bgCanvas 意味着它落在底栏 tint(1) 的**下面**，
+   所以要比 DOM 版本画得更实一点才够亮（见下面的两组 alpha）。
+
+   DOM 里那两个 <button> 仍然保留文字：屏幕阅读器读它、
+   它还决定玻璃块的宽度和吸附位置。只是被 .nav-labels-in-canvas 藏成透明。 */
+function drawNavLabels(){
+  const br = navBar.getBoundingClientRect();
+  if(!(br.width > 0) || !(br.height > 0)) return false;
+
+  bgCtx.save();
+  bgCtx.setTransform(dpr,0,0,dpr,0,0);          // 之后一律用 CSS px 作坐标
+  bgCtx.textAlign = 'center';
+  /* 基线用 alphabetic + 字体实际度量自己算，不用 textBaseline='middle'：
+     Chromium 的 'middle' 是拿 em 盒对中（基线 = y + 0.5em），而 DOM 里 flex 居中
+     一行文字时基线落在 y + (ascent-descent)/2。system-ui 回落到的中文字体
+     ascent≈0.9em、descent≈0.25em，两者差 2.2px —— 实测画布字比 DOM 高 2.18px，
+     字会明显偏上。 */
+  bgCtx.textBaseline = 'alphabetic';
+  /* Chromium 99+ 才有 ctx.letterSpacing。CSS 里 .navItem 是 letter-spacing:2px，
+     不跟着设的话画布上的字会比 DOM 窄 4px 左右，和按钮盒子对不齐。 */
+  const 有字距 = 'letterSpacing' in bgCtx;
+
+  navBtns.forEach((b,i)=>{
+    const r = b.getBoundingClientRect();
+    if(!(r.width > 0)) return;
+    const cs = getComputedStyle(b);
+    bgCtx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    const 字距 = (cs.letterSpacing === 'normal') ? 0 : (parseFloat(cs.letterSpacing) || 0);
+    if(有字距) bgCtx.letterSpacing = 字距 + 'px';
+
+    /* 阴影跟着该处的背景亮度走 —— 白字压在亮图上是没有对比度的。
+       canvas 只有一组 shadow，DOM 那个 0 0 8px 的外扩圈并进 blur 里。
+       描边删掉之后这圈柔和阴影就是唯一在软化字形的东西，所以往浅里收。
+       alpha 是"浅不浅"的那根杆（blur 是"聚不聚"：同样是 .40，blur 1/2/3 的
+       阴影谷是 -17.2 / -40 / -47.8，blur 越大越深，不是越小越浅）。
+       在同一个字上扫过（其余全同，量"有字-无字"的负峰，即字外那圈暗环）：
+           亮底  a 0     .10   .16   .22   .28   .34   .40   .48
+                 谷 -0.9  -10.0 -17.8 -21.7 -27.1 -35.0 -40.0 -47.9
+           暗底  a 0     .10   .16   .22   .28   .35   .45
+                 谷 -0.9  -15.9 -23.7 -32.7 -41.7 -51.8 -64.8
+       .40 -> .28 浅 32%，.35 -> .22 浅 38%。blur 两支都没动。 */
+    const 暗底 = sampleLuminance(r.left,r.top,r.width,r.height) < 0.5;
+    bgCtx.shadowColor   = 暗底 ? 'rgba(0,0,0,.22)' : 'rgba(0,0,0,.28)';
+    bgCtx.shadowBlur    = (暗底 ? 4 : 2) * dpr;
+    bgCtx.shadowOffsetY = (暗底 ? 1 : 0) * dpr;
+    /* 选中态更实，未选中留一点透明 —— 和 .navItem / [aria-current] 的两组色一致，
+       只是各自加了 0.15 顶掉底栏 tint 那一层（画在 tint 下面会暗一档）。 */
+    bgCtx.fillStyle = i === navActive ? '#ffffff' : 'rgba(255,255,255,.88)';
+    /* 横向：CSS 的 letter-spacing 每个字后面都加（含末字），字身中心因此比
+       盒子中心靠左 n*L/2；canvas 的 ctx.letterSpacing 只在字之间加，靠左 (n-1)*L/2。
+       两者差 L/2 —— 实测画布字比 DOM 靠右 0.85px（L=2 时正好 1px）。减掉。 */
+    const t = b.textContent, x = r.left + r.width/2 - 字距/2;
+    /* 复刻 flex 居中一行文字时基线的落点：行盒上下各分一半 half-leading，
+       基线 = 行盒顶 + halfLeading + ascent，化简后就是 中心 + (ascent-descent)/2，
+       和 line-height:normal 的行距无关。 */
+    const mt = bgCtx.measureText(t);
+    const asc = mt.fontBoundingBoxAscent, dsc = mt.fontBoundingBoxDescent;
+    const y = r.top + r.height/2 + ((asc - dsc) / 2);
+    bgCtx.fillText(t, x, y);
+  });
+
+  bgCtx.shadowColor = bgCtx.shadowBlur = bgCtx.shadowOffsetY = 0;
+  bgCtx.restore();
+  return true;
+}
+
+/* 只重画底栏那两个标签，不动背景照片和磨砂。
+   画布上要恢复"照片 → 磨砂"的顺序，所以这张图得整个重铺 ——
+   没有别的办法：磨砂是就地高斯，跑第二遍会把已经糊过的地方再糊一遍。
+   实测全屏重绘（976x608 @dpr1）约 8~12ms，换位时一次可以接受；
+   代价是换位的第一帧会掉一下，不会看得出来。 */
+function navPaintLabels(){
+  if(!bgCanvas.width) return;
+  try{
+    if(drawNavLabels()) document.documentElement.classList.add('nav-labels-in-canvas');
+  }catch(e){
+    /* 画不出来就把 DOM 文字放回去，绝不让底栏一个标签都不剩 */
+    document.documentElement.classList.remove('nav-labels-in-canvas');
+    console.warn('标签画进画布失败，已回退到 DOM 文字：', e);
+  }
+}
+
+/* bgCanvas 的版本号。整张图（含烘进去的底栏磨砂）只在 renderBackground 里变 ——
+   图片加载完、换位重画标签、窗口缩放，就这三处。
+   描边层每帧都要重画（元素在动），但没必要每帧重传这张 1.87MB 的图：
+   见 initStroke 里 renderStroke 的注释。 */
+let bgVersion = 0;
+
+function renderBackground(){
+  if(bgImg && bgImg.complete && bgImg.naturalWidth){
+    drawImageBg(bgImg);
+  }else{
+    drawFallbackBg();
+  }
+  /* 磨砂必须画在玻璃取样之前：glass-gl 采样的是 bgCanvas，
+     模糊烘进去之后玻璃块折射到的就是底栏正在显示的那张高斯模糊图。
+     顺序反过来就成了"玻璃块折射锐利背景、底栏却是模糊的"，两者对不上。
+     标签同理，而且必须排在磨砂之后 —— 它是玻璃块要折射的内容之一，
+     先被磨一遍的话字会跟着糊掉，那就不是"折射"而是"看不清"了。 */
+  drawFrostBar();
+  drawFrostCards();   // 同理：卡片玻璃块折射到的也得是糊的那张
+  navPaintLabels();
+  bgVersion++;                          // 告诉描边层：图换了，该重传纹理
+  if(glass && glass.setBackground) glass.setBackground(bgCanvas);
+  adaptTextShadows();
+}
+
+function loadBackgroundImage(){
+  bgImg = new Image();
+  bgImg.onload = ()=>renderBackground();
+  bgImg.onerror = ()=>{
+    console.warn('背景图加载失败：'+BG_URL+'，已改用渐变背景');
+    renderBackground();
+  };
+  bgImg.src = BG_URL;   // 带版本号，见 BG_URL
+}
+
+/* ---------- 图标 / 文字阴影自适应 ---------- */
+const SHADOW_DARK  = '0 1px 4px rgba(0,0,0,.35)';
+const SHADOW_LIGHT = '0 1px 5px rgba(0,0,0,.6), 0 0 8px rgba(0,0,0,.4)';
+
+function sampleLuminance(cssX,cssY,cssW,cssH){
+  const x=Math.max(0,Math.min(bgCanvas.width-1,  Math.floor((cssX+cssW*0.2)*dpr)));
+  const y=Math.max(0,Math.min(bgCanvas.height-1, Math.floor((cssY+cssH*0.2)*dpr)));
+  const w=Math.max(1,Math.min(bgCanvas.width-x,  Math.floor(cssW*0.6*dpr)));
+  const h=Math.max(1,Math.min(bgCanvas.height-y, Math.floor(cssH*0.6*dpr)));
+  try{
+    const d=bgCtx.getImageData(x,y,w,h).data;
+    let sum=0,cnt=0;
+    const step=Math.max(4,Math.floor(w*h/160)*4);
+    for(let i=0;i<d.length;i+=step){
+      sum+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+      cnt++;
+    }
+    return cnt>0 ? sum/cnt/255 : 0.5;
+  }catch(e){ return 0.5; }   // file:// 或跨域时降级
+}
+
+/* 分割线：按其所处位置的背景亮度自动切换黑/白。
+   取样和黑/白切换的阈值不动，只把三个 alpha 和辉光压下去 ——
+   亮暗仍然自动适配，只是线退到背景里一点，不跟标题抢视线。
+   这几个值和 CSS 里 #titlebar::after 的兜底值是一套的，两边都要改。 */
+const DIVIDER_SAMPLE_H = 10;      // 取样带高度，太窄容易被照片细节误导
+function adaptDivider(){
+  const bar=document.getElementById('titlebar');
+  const r=bar.getBoundingClientRect();
+  const lum=sampleLuminance(0, Math.max(0, r.bottom-DIVIDER_SAMPLE_H), innerWidth, DIVIDER_SAMPLE_H);
+  const onDark = lum < 0.5;
+  if(onDark){
+    // 暗背景 -> 白线（原 .45/.88/.45）
+    bar.style.setProperty('--div-edge','rgba(255,255,255,0.20)');
+    bar.style.setProperty('--div-core','rgba(255,255,255,0.44)');
+    bar.style.setProperty('--div-glow','rgba(255,255,255,0.16)');
+  }else{
+    // 亮背景 -> 黑线（原 .34/.64/.30）
+    bar.style.setProperty('--div-edge','rgba(0,0,0,0.15)');
+    bar.style.setProperty('--div-core','rgba(0,0,0,0.32)');
+    bar.style.setProperty('--div-glow','rgba(0,0,0,0.11)');
+  }
+  return {lum:+lum.toFixed(3), onDark};
+}
+
+function adaptTextShadows(){
+  buttons.forEach(btn=>{
+    const r=btn.getBoundingClientRect();
+    const shadow = sampleLuminance(r.left,r.top,r.width,r.height) < 0.5 ? SHADOW_DARK : SHADOW_LIGHT;
+    const svg=btn.querySelector('svg');
+    if(svg) svg.style.filter = `drop-shadow(${shadow})`;
+    btn.style.color = shadow===SHADOW_DARK ? 'rgba(255,255,255,.96)' : '#ffffff';
+  });
+  const tr=appTitle.getBoundingClientRect();
+  const tShadow = sampleLuminance(tr.left,tr.top,tr.width,tr.height) < 0.5 ? SHADOW_DARK : SHADOW_LIGHT;
+  appTitle.style.textShadow = tShadow;
+  // 标签在本地服务下是隐藏的，跳过以免对 0 宽区域取样
+  if(modeTag.offsetWidth || modeTag.offsetHeight){
+    const mr=modeTag.getBoundingClientRect();
+    modeTag.style.textShadow = sampleLuminance(mr.left,mr.top,mr.width,mr.height) < 0.5 ? SHADOW_DARK : SHADOW_LIGHT;
+  }
+  /* 底栏底色按整条区域取样切换深/浅（两组文字共用一块底，必须一起保证可读）；
+     文字阴影则各按自己的位置取样 —— 和上面每个元素就地取样的逻辑一致。 */
+  const nr=navBar.getBoundingClientRect();
+  const navOnDark = sampleLuminance(nr.left,nr.top,nr.width,nr.height) < 0.5;
+  /* 底色是"半透明"的唯一开关，深浅随该区域背景亮度切换。
+     这几个 alpha 是实测 bracketing 出来的：
+       0.26 + 半径 16 + 底部 0.20 暗边 → 内部高频能量掉到 0.2，
+         底栏变成一块不透明的深色圆角矩形（"不半透明"）。
+       0.20 + 半径 4 → 结构透出来了，但底色仍偏厚（"透明度大一点"）。
+       0.12 → 只做一点点压暗，看得清背后是谁。
+     现在 0.08 / 0.06：底栏的磨砂也一并去掉了（FROST_R = 0），
+     没有模糊帮忙融背景，底色就再薄一档，让背后的结构直接透上来。
+     可见度改由那一圈棱边（--nav-edge / --nav-ring）撑着，
+     标签本身在 bgCanvas 里是带自适应阴影的，所以底色再薄也读得清。 */
+  if(navOnDark){
+    navBar.style.setProperty('--nav-tint',  'rgba(255,255,255,0.06)');
+    navBar.style.setProperty('--nav-edge',  'rgba(255,255,255,0.34)');
+    navBar.style.setProperty('--nav-shade', 'rgba(0,0,0,0.12)');
+    navBar.style.setProperty('--nav-ring',  'rgba(255,255,255,0.16)');
+  }else{
+    navBar.style.setProperty('--nav-tint',  'rgba(0,0,0,0.08)');
+    navBar.style.setProperty('--nav-edge',  'rgba(255,255,255,0.24)');
+    navBar.style.setProperty('--nav-shade', 'rgba(0,0,0,0.12)');
+    navBar.style.setProperty('--nav-ring',  'rgba(255,255,255,0.12)');
+  }
+  /* 底栏那两个标签的阴影由 drawNavLabels 画进 bgCanvas 时自己按亮度处理，
+     这里不能再设内联 textShadow —— 内联样式压得住 CSS，
+     会在已经透明的字底下留一层阴影鬼影。 */
+  /* 卡片的文字在 DOM 里（压在玻璃块上面，不参与折射），所以走内联 textShadow，
+     和标题、按钮同一套。四张卡可能横跨明暗不同的背景，逐张就地取样。 */
+  document.querySelectorAll('.card').forEach(btn=>{
+    const r=btn.getBoundingClientRect();
+    btn.style.textShadow = sampleLuminance(r.left,r.top,r.width,r.height) < 0.5 ? SHADOW_DARK : SHADOW_LIGHT;
+  });
+  adaptDivider();
+}
+
+/* ---------- 色调工具（玻璃染色用） ---------- */
+function hslToRgb(h,s,l){
+  if(s===0) return [l,l,l];
+  const q = l<.5 ? l*(1+s) : l+s-l*s;
+  const p = 2*l-q;
+  const f = t=>{
+    if(t<0)t+=1; if(t>1)t-=1;
+    if(t<1/6) return p+(q-p)*6*t;
+    if(t<1/2) return q;
+    if(t<2/3) return p+(q-p)*(2/3-t)*6;
+    return p;
+  };
+  return [f(h+1/3), f(h), f(h-1/3)];
+}
+
+/* ---------- 玻璃边缘彩色描边（移植自 Liquid glass.html） ---------- */
+function initStroke(){
+  const gl = strokeCanvas.getContext('webgl', {alpha:true, premultipliedAlpha:false});
+  if(!gl){ console.warn('WebGL 不可用，描边层已跳过'); return; }
+  strokeGL = gl;
+  gl.viewport(0,0,strokeCanvas.width,strokeCanvas.height);
+
+  const vs='attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}';
+  const fs=`
+    precision highp float;
+    uniform vec2 u_res;
+    uniform vec2 u_c,u_s; uniform float u_r;
+    uniform float u_strokeScale;
+    uniform sampler2D u_bg;
+
+    float sdRB(vec2 p,vec2 b,float r){
+      vec2 q=abs(p)-b+r;
+      return min(max(q.x,q.y),0.)+length(max(q,0.))-r;
+    }
+
+    void main(){
+      vec2 fc=gl_FragCoord.xy;
+      vec2 p=fc-u_c;
+      float r=min(u_r,min(u_s.x,u_s.y)*0.5);
+      float d=sdRB(p,u_s*0.5,r);
+      float s=u_strokeScale;
+      float maxD=4.5*s;
+      if(d<-0.2*s||d>maxD) discard;
+      float innerFade=smoothstep(-0.2*s,0.8*s,d);
+      /* 外沿渐变收窄：原来 1.2s~3.8s 跨 4.68 设备像素，描边边缘发软。
+         收到 1.0s~2.8s（3.24 设备像素）后，dpr 2 下 10-90% 过渡
+         1.50 -> 1.00 CSSpx，边缘斜率 +36%，dpr 3 下环的可见宽度不变。
+         再往下收（如 0.9s~2.4s）只会让环变硬变窄，清晰度不再提升。 */
+      float outerFade=1.0-smoothstep(1.0*s,2.8*s,d);
+      float alpha=innerFade*outerFade;
+      if(alpha<0.01) discard;
+      vec2 oppUv=clamp((2.0*u_c-fc)/u_res,0.0,1.0);
+      vec3 col=vec3(0.0);
+      float wsum=0.0;
+      float blurR=1.5*s;
+      for(float y=-1.0;y<=1.0;y+=1.0){
+        for(float x=-1.0;x<=1.0;x+=1.0){
+          float w=(2.0-abs(x))*(2.0-abs(y));
+          vec2 off=vec2(x,y)*blurR/u_res;
+          col+=texture2D(u_bg,clamp(oppUv+off,0.0,1.0)).rgb*w;
+          wsum+=w;
+        }
+      }
+      col/=wsum;
+      float gray=dot(col,vec3(0.299,0.587,0.114));
+      col=mix(vec3(gray),col,1.3);
+      col=col*1.5+0.12;
+      col=mix(col,vec3(1.0),0.15);
+      gl_FragColor=vec4(col,alpha*0.88);
+    }`;
+
+  const mk=(t,src)=>{
+    const s=gl.createShader(t);
+    gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error('SHADER ERR:',gl.getShaderInfoLog(s));
+    return s;
+  };
+  const prog=gl.createProgram();
+  gl.attachShader(prog,mk(gl.VERTEX_SHADER,vs));
+  gl.attachShader(prog,mk(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(prog); gl.useProgram(prog);
+
+  const buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const aPos=gl.getAttribLocation(prog,'a');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+
+  const uRes=gl.getUniformLocation(prog,'u_res');
+  const uC=gl.getUniformLocation(prog,'u_c');
+  const uS=gl.getUniformLocation(prog,'u_s');
+  const uR=gl.getUniformLocation(prog,'u_r');
+  const uScale=gl.getUniformLocation(prog,'u_strokeScale');
+  const uBg=gl.getUniformLocation(prog,'u_bg');
+
+  let tex=null;
+  let texVersion=-1;      // 已经传上 GPU 的 bgCanvas 版本
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  (function renderStroke(){
+    if(!tex) tex=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+    /* 只在 bgCanvas 真的换了才重传纹理。
+       描边环本身每帧都要重画 —— 元素在动，环得跟着动；
+       但底下那张图是静态的，952x516 一帧 1.87MB，
+       实测单次 texImage2D 中位 4.9ms、最坏 24.3ms，
+       每帧都传等于白烧 60fps 一帧预算的 29%。
+       更要紧的是它是主线程上的同步上传：一卡，玻璃透镜和这个环
+       就要等下一帧才画得出来，而块的盒子是合成器按帧表推的、
+       不等主线程 —— 于是环和透镜落在盒子后面，越卡越明显，
+       看着就是"块和它底下的东西错开了"。 */
+    if(texVersion !== bgVersion){
+      try{
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,bgCanvas);
+        texVersion = bgVersion;
+      }catch(err){
+        /* 背景画布被污染 —— file:// 下浏览器不允许读取本地图片像素，
+           上传纹理必然抛 SecurityError。描边层在这里无法工作，
+           干净地停掉循环，不要每帧抛一次未捕获异常。 */
+        console.warn('描边层已停用：背景画布被污染。', err.message||err);
+        return;   // 不再 requestAnimationFrame，循环到此结束
+      }
+    }
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.uniform1i(uBg,0);
+    gl.uniform2f(uRes,strokeCanvas.width,strokeCanvas.height);
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    for(const g of visibleGlassEls()){
+      const rect=g.el.getBoundingClientRect();
+      if(rect.width===0||rect.height===0) continue;
+      gl.uniform2f(uC,(rect.left+rect.width/2)*dpr,(innerHeight-(rect.top+rect.height/2))*dpr);
+      gl.uniform2f(uS,rect.width*dpr,rect.height*dpr);
+      gl.uniform1f(uR,g.radius*dpr);
+      gl.uniform1f(uScale,g.strokeScale);
+      gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    }
+    requestAnimationFrame(renderStroke);
+  })();
+}
+
+/* ---------- 液态玻璃（glass-gl，异步加载，不阻塞背景） ---------- */
+async function initGlass(){
+  try{
+    /* 优先用本地副本：head 里的经典 defer 脚本已把 createGlass 挂到 window 上，
+       这条路不碰网络，file:// 和 http 下都通。拿不到才回退 CDN。 */
+    let createGlass = window.createGlass;
+    if(typeof createGlass !== 'function'){
+      console.warn('本地 ' + GLASS_LOCAL + ' 未就绪，回退 CDN');
+      const mod = await import(/* @vite-ignore */ GLASS_CDN);
+      createGlass = mod.createGlass || (mod.default && mod.default.createGlass);
+    }
+    if(typeof createGlass !== 'function') throw new Error('createGlass 不可用：本地副本和 CDN 都没拿到');
+
+    /* dpr 必须显式传：glass-gl 内部是
+         min(devicePixelRatio, 传入值或 2)
+       不传就默认封顶 2，3x 设备上玻璃体会停在 2x（实测 glassCanvas 2000x1400
+       而 bg/stroke 已到 3000x2100），玻璃体反而成了整块画面里最糊的一层。
+       传本页算好的 dpr（含像素预算降档结果），三张画布保持同一分辨率。 */
+    /* transparent:true 是必须的。
+       默认 false 时着色器输出 vec4(mix(bg,lighting,bodyMask).rgb, 1.0) ——
+       alpha 恒为 1，也就是 glassCanvas 会把整幅背景不透明地重画一遍。
+       它的 z-index 是 2，压在底部磨砂底栏(1)之上，于是底栏被整幅盖死：
+       实测把 --nav-tint 从 0 扫到 0.40，栏内亮度恒为 0.7437 纹丝不动；
+       把 glassCanvas display:none 后 tint 立刻生效（0.26 -> 栏内 0.5899 / 压暗 0.163）。
+       顺带这也解释了「刷新时闪一下」：rAF 循环开跑前画布是空的，底栏露一下就被盖住。
+
+       改成 true 后画布只在玻璃体处有像素（bodyMask 之外 alpha=0），
+       底栏露出来，玻璃块照旧压在底栏之上。
+       玻璃体中心 bodyMask=1，两种模式的输出都是 lighting，观感不变；
+       玻璃块的折射改为透出底栏的底色而不是裸背景，对「玻璃块浮在磨砂底栏上」更准确。
+       glass-gl 的 context 建的是 premultipliedAlpha:true，与着色器的预乘输出一致。 */
+    glass = createGlass({ canvas: glassCanvas, background: bgCanvas, dpr: dpr, transparent: true });
+    glass.setParams({
+      refraction: 0.5,
+      /* blur 直接给 0。glass-gl 自带的是 9x9 等权均值盒（81 个 tap 权重全 1.0，
+         取样偏移 ±4*blur 个设备像素），不是高斯。
+         之前留 0.2，注释写的是"只用来压折射位移的锯齿"—— 量下来那是自欺：
+         在同一个字上扫 blur（其余参数全同，量块内标签的字形）——
+             blur  0     0.05   0.2    0.5    1.0
+             字峰 109.7  105.7  94.7   67.3   34.0     <- 有字 - 无字 的峰值
+             峰谷 148.9  138.7  115.4  80.3   40.1
+         0.2 就已经吃掉 13.6% 的字峰、22.5% 的峰谷差、52.8% 的边缘锐度。
+         底栏两个标签正在块下，糊 20% 是看得出来的，所以给 0。
+
+         真正的模糊由 drawFrostBar() 以高斯烘进 bgCanvas，那是底栏该有的样子。
+
+         注意 blur 是**全局**的：glass-gl 的 setParams 是 Object.assign 到同一个
+         参数对象上，渲染循环里 uBlur 只从那一个对象读（register 的逐元素选项
+         里只有 radius 被用到）。所以 blur:0 会让标题栏那两块玻璃一起变锐，
+         没法只给底栏。要分开得再开一个 glass 实例（多一个 WebGL 上下文）。 */
+      blur: 0,
+      liquidness: 0.1,
+      edgeLight: 0.2,
+      edgeFrost: 0.0,
+      dispersion: 0.0,
+      saturation: 1.1,
+      curve: 3.6,
+      lightAngle: 40,
+      radius: GLASS_RADIUS,
+      tint: [1, 1, 1]
+    });
+    /* 逐元素传 radius：glass-gl 里 register(el,{radius}) 覆盖全局 radius，
+       四个玻璃体尺寸各不相同（40/40/22/44），共用一个圆角必然有一个是错的 */
+    visibleGlassEls().forEach(g => glass.register(g.el, { radius: g.radius }));
+    /* 搜索框如果此刻正开着，上面那遍已经把它注册过了 ——
+       置位，免得 searchOpen 再补一次、注册成两个玻璃体。 */
+    searchGlassOn = !searchBar.hidden;
+    document.documentElement.classList.add('glass-ok');
+    renderBackground();          // 玻璃就绪后把背景交给它做折射源
+    console.log('液态玻璃已启用');
+  }catch(err){
+    console.warn('glass-gl 加载失败，已降级为 CSS 毛玻璃：', err);
+    glass = null;
+  }finally{
+    /* 玻璃块的两种形态（CSS 磨砂 vs canvas 折射）差别很大，
+       所以先藏起来，等这里判定完再一次性放行，刷新时就不会闪。
+       兜底定时器防 CDN 卡在 pending —— 否则玻璃块会一直不出现。 */
+    navPill.style.visibility = 'visible';
+  }
+}
+
+/* ---------- 兼容模式标签 ----------
+   两种跑法都是纯本地（server.mjs 只监听 127.0.0.1，数据不出本机），
+   所以正常情况不显示任何模式标签。
+   只有「真的会降级」时才显示 —— 必须同时满足两条：
+     1. file:// 打开（http 下 background.jpg 是同源的，画布不会被污染）
+     2. bg-data.js 不在（没有内嵌的 data:URL，裸路径跨源 -> 画布被污染 ->
+        getImageData 和 texImage2D 全抛 SecurityError -> 玻璃和描边层降级）
+   光看 protocol 不够：有 bg-data.js 时 file:// 同样是完整玻璃，
+   这时候还挂一个「兼容模式」就是误报了。
+   判断只依赖这两条，不等 glass-gl 加载完成（要走 CDN，约 4 秒），
+   因此不会出现先闪一下再变的文案。 */
+const IS_FILE_PROTOCOL = location.protocol === 'file:';
+const NEEDS_FALLBACK   = IS_FILE_PROTOCOL && !window.__bgData;
+
+function applyModeTag(){
+  if(NEEDS_FALLBACK){
+    modeTag.hidden = false;
+    modeTag.textContent = '兼容模式';
+    modeTag.title = '当前以 file:// 打开，且缺少 bg-data.js：'
+                  + '背景图是跨源的，浏览器禁止读取它的像素，画布被标记为"已污染"，'
+                  + '分割线/文字阴影的亮度自适应和液态玻璃都已降级。\n'
+                  + '把 bg-data.js 和 index.html 放在同一个目录即可恢复完整效果；'
+                  + '它由 background.jpg 生成，换背景图后需重新运行「重新生成 bg-data.ps1」。';
+  }else{
+    // http 下同源，或 file:// 下有内嵌 data:URL —— 都是完整玻璃，无需任何模式提示
+    modeTag.hidden = true;
+    modeTag.removeAttribute('title');
+  }
+  modeTag.setAttribute('role','status');
+  return modeTag.hidden ? '(不显示)' : modeTag.textContent;
+}
+
+/* ---------- 启动：先定好模式文案，再渲染背景，最后异步加载玻璃 ---------- */
+applyModeTag();
+sizeCanvas();
+navPlace(0, false);   // 先给指示块一个非零宽度，visibleGlassEls 才会把它交给 glass-gl
+initStroke();
+renderBackground();
+loadBackgroundImage();
+
+/* 液态流动：与参考文件一致，玻璃色调持续循环 + 液面强度波动 */
+let hue = 0, frame = 0;
+(function animateGlass(){
+  frame++;
+  hue = (hue + 0.08) % 360;
+  if(glass && glass.setParams){
+    glass.setParams({
+      tint: hslToRgb(hue/360, 0.45, 0.88),
+      liquidness: 0.1 + Math.sin(frame*0.015)*0.02,
+      lightAngle: 40 + Math.sin(frame*0.006)*8
+    });
+  }
+  requestAnimationFrame(animateGlass);
+})();
+
+/* ---------- 尺寸变化 ---------- */
+let resizeTimer;
+window.addEventListener('resize', ()=>{
+  sizeCanvas();                                              // 画布即时跟随，避免拉伸
+  navPlace(navActive, false);                                // 指示块重新贴合（走 0.28s 过渡，不做形变）
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(renderBackground, 150);           // 背景重绘防抖
+});
+
+/* ---------- 搜索框的开合 ---------- */
+/* 平时 display:none，量出来宽高都是 0，initGlass 里那遍 visibleGlassEls
+   自然不会把它交给 glass-gl，描边层每帧那遍也会跳过它。
+   所以第一次打开时必须补注册一次。玻璃是异步从 CDN 加载的（约 4s），
+   两条路径都要留：
+     先开框、后加载玻璃 -> initGlass 里的 visibleGlassEls 会带上它（在 initGlass 末尾置位）
+     先加载玻璃、后开框 -> 这里的 registerSearchGlass 补上
+   两条路径都跑的话会向 glass-gl 注册两次、画出重影，所以用 searchGlassOn 挡掉。 */
+let searchGlassOn = false;
+function registerSearchGlass(){
+  if(glass && glass.register && !searchGlassOn){
+    glass.register(searchBar, { radius: SEARCH_R });
+    searchGlassOn = true;
+  }
+}
+
+let searchClosing = false;
+function searchOpen(){
+  if(!searchBar.hidden) return;
+  searchBar.hidden = false;
+  searchBar.classList.remove('closing');
+  searchClosing = false;
+  registerSearchGlass();
+  void searchBar.offsetWidth;        /* 强制回流：不然 width:0 -> var(--sb-w)
+                                         会被当成同一帧的两个值，过渡不跑 */
+  searchBar.classList.add('open');
+  /* 刻意不 focus。focus() 会当场拉起软键盘，键盘一顶可视区被压掉一大截，
+     刚弹出来的胶囊就被顶出屏幕，弹出动画也就白做了。
+     要输入点一下框就行 —— 原生行为，点 input 自然会 focus 并拉起键盘。
+     收起逻辑不依赖焦点状态：外面点击走的是 searchBar.contains(e.target)，
+     Esc 挂在 document 上，都跟 input 有没有焦点无关。 */
+}
+function searchClose(){
+  if(searchBar.hidden || searchClosing) return;
+  searchClosing = true;
+  searchBar.classList.remove('open');
+  searchBar.classList.add('closing');
+  searchInput.blur();
+}
+function searchToggle(){
+  (searchBar.hidden || searchClosing) ? searchOpen() : searchClose();
+}
+/* 收起动画走完才 display:none。中途不能提前藏：那一下宽高直接变 0，
+   玻璃和描边环会在一帧里从"细条"塌成"没有"，看着是闪断。 */
+searchBar.addEventListener('transitionend', e=>{
+  if(e.propertyName !== 'width' || !searchBar.classList.contains('closing')) return;
+  searchBar.hidden = true;
+  searchBar.classList.remove('closing');
+  searchClosing = false;
+});
+/* 窗口尺寸变了要重算 --sb-w（它是 vw 相关的），收着的状态直接重置，
+   免得留下一个半开的胶囊。 */
+window.addEventListener('resize', ()=>{
+  if(searchBar.hidden || searchClosing) return;
+  searchBar.classList.remove('open');
+  void searchBar.offsetWidth;
+  searchBar.classList.add('open');
+});
+
+buttons[1].addEventListener('click', ()=>{ searchToggle(); });
+/* 输入本身还不做检索，先把值打出来，等具体搜索逻辑 */
+searchInput.addEventListener('keydown', e=>{
+  if(e.key === 'Enter') console.log('搜索乐谱：', searchInput.value.trim());
+});
+document.addEventListener('keydown', e=>{
+  if(e.key === 'Escape' && !searchBar.hidden) searchClose();
+});
+/* 点外面收起。用捕获阶段，抢在输入框自己的事件之前判断；
+   点搜索按钮本身不算"外面"，否则会在 click 收起之前先被判一次。 */
+document.addEventListener('pointerdown', e=>{
+  if(searchBar.hidden || searchClosing) return;
+  if(searchBar.contains(e.target) || buttons[1].contains(e.target)) return;
+  searchClose();
+}, true);
+
+/* ---------- 按钮交互占位：菜单逻辑待接入 ---------- */
+buttons[0].addEventListener('click', ()=>console.log('打开菜单'));
+
+/* 玻璃异步加载 */
+initGlass();
+/* CDN 极端情况卡住时的兜底：8s 后无论如何放行玻璃块 */
+setTimeout(()=>{ navPill.style.visibility = 'visible'; }, 8000);
+</script>
+</body>
+</html>
